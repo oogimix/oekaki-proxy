@@ -1,19 +1,19 @@
 // api/proxy.js
 // Vercel Node (CommonJS)
-// - HTML: 上流の EUC-JP/CP932/ISO-2022-JP を UTF-8 に再エンコード
-// - <meta charset> を安全に utf-8 へ正規化
-// - href/src/action 等の相対URLを /api/proxy?u=... に書き換え
-// - XFO/CSP, content-length, content-encoding を削除（iframe & 非圧縮）
-// - 30x Location を可能な範囲でプロキシに書き換え
-// - ★ POST/マルチパート等の “リクエストボディをそのまま中継” ← PAINT対策
+//
+// ・文字化け対策：上流(EUC/CP932/ISO-2022-JP)→UTF-8再エンコード
+// ・<meta charset> を安全に utf-8 へ統一
+// ・href/src/action 等の相対URL→ /api/proxy?u=... に書き換え
+// ・XFO/CSP, content-length, content-encoding を削除
+// ・POST/マルチパート等のボディ中継（PAINT用）
+// ・★ Set-Cookie を vercel 側へ書き換え保存（SameSite=None; Secure 付与）
 
 const iconv = require('iconv-lite');
-require('iconv-lite/encodings'); // ISO-2022-JP などを有効化
+require('iconv-lite/encodings'); // ISO-2022-JP 有効化
 
-// 上流のオリジン（末尾 / 必須）
 const UPSTREAM_ORIGIN = 'https://sush1h4mst3r.stars.ne.jp/';
 
-// --- ユーティリティ ---
+// ---------- 基本ユーティリティ ----------
 function buildSelfOrigin(req) {
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host  = (req.headers['x-forwarded-host']  || req.headers.host || '').split(',')[0].trim();
@@ -28,8 +28,6 @@ function buildProxyUrl(req, nextPathname) {
   const uParam = encodeURIComponent(nextPathname.replace(/^\//, ''));
   return `${origin}/api/proxy?u=${uParam}`;
 }
-
-// NodeのIncomingMessageからリクエスト本文を丸ごと読む（POST/PUT等）
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -39,7 +37,7 @@ function readRawBody(req) {
   });
 }
 
-// --- エンコ関連 ---
+// ---------- 文字コード ----------
 const ALIAS = new Map([
   ['utf8','utf-8'], ['utf-8','utf-8'],
   ['eucjp','euc-jp'], ['euc-jp','euc-jp'], ['euc_jp','euc-jp'],
@@ -58,8 +56,8 @@ function detectFromMeta(buf){
 }
 function detectFromBytes(buf){
   const s = buf.toString('latin1');
-  if (/\x1B\$[@B]|\x1B\(B|\x1B\(J/.test(s)) return 'iso-2022-jp'; // JIS
-  if (buf.includes(0x8E) || buf.includes(0x8F)) return 'euc-jp';  // EUC 傾向
+  if (/\x1B\$[@B]|\x1B\(B|\x1B\(J/.test(s)) return 'iso-2022-jp';
+  if (buf.includes(0x8E) || buf.includes(0x8F)) return 'euc-jp';
   return 'cp932';
 }
 function isHtmlLike(contentType, pathname){
@@ -68,7 +66,7 @@ function isHtmlLike(contentType, pathname){
   return p.endsWith('.html') || p.endsWith('.htm') || p.endsWith('.php') || p.endsWith('/');
 }
 
-// --- レスポンスヘッダ整形 ---
+// ---------- レスポンスヘッダ整形 ----------
 function sanitizeHeaders(h, { isHtml, finalCharset }) {
   const out = new Headers();
   for (const [k,v] of h.entries()) out.set(k, v);
@@ -79,27 +77,49 @@ function sanitizeHeaders(h, { isHtml, finalCharset }) {
   return out;
 }
 
-// --- meta charset を安全に utf-8 へ ---
+// ---------- Set-Cookie 書き換え（重要） ----------
+function rewriteSetCookieHeaders(upstreamRes, req, res) {
+  // undici (Node fetch) では headers.raw() が使える
+  const raw = upstreamRes.headers.raw?.() || {};
+  const setCookies = raw['set-cookie'] || [];
+  if (!setCookies.length) return;
+
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  const rewritten = setCookies.map(line => {
+    // Domain=... を vercel ホストに差し替え（または削除）
+    let s = line
+      .replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`)
+      .replace(/;\s*Path=[^;]*/i, '; Path=/'); // 広めに
+
+    // SameSite, Secure を強制
+    if (!/;\s*SameSite=/i.test(s)) s += '; SameSite=None';
+    if (!/;\s*Secure/i.test(s))    s += '; Secure';
+
+    // HttpOnly/Secure 等は上流のまま＋追記
+    return s;
+  });
+
+  res.setHeader('Set-Cookie', rewritten);
+}
+
+// ---------- meta charset を安全に utf-8 へ ----------
 function rewriteMetaToUtf8(html) {
   let out = html;
-  // charset=... → utf-8（クォート有無対応）
   out = out.replace(
     /<meta([^>]*?)\bcharset\s*=\s*(['"]?)[^"'>\s;]+(\2)([^>]*)>/ig,
     '<meta$1charset="utf-8"$4>'
   );
-  // http-equiv=content-type の charset も utf-8 へ
   out = out.replace(
     /<meta([^>]*?\bhttp-equiv\s*=\s*(['"])content-type\2[^>]*?\bcontent\s*=\s*(['"][^"']*?\bcharset=))[^"'>\s;]+([^>]*?)>/ig,
     '<meta$1utf-8$4>'
   );
-  // head 内に無ければ追加
   if (!/charset\s*=\s*["']?utf-8/i.test(out)) {
     out = out.replace(/<head([^>]*)>/i, '<head$1>\n<meta charset="utf-8">');
   }
   return out;
 }
 
-// --- 相対URLをプロキシURLに ---
+// ---------- 相対URL→プロキシURL ----------
 function absolutizeToUpstream(u, baseAbs){
   try { return new URL(u, baseAbs).toString(); } catch { return null; }
 }
@@ -128,7 +148,7 @@ function rewriteAssetUrls(html, htmlAbsUrl, req){
   );
 }
 
-// --- メイン ---
+// ---------- メイン ----------
 module.exports = async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -136,17 +156,14 @@ module.exports = async function handler(req, res) {
     if (!u) { res.statusCode = 400; res.end('Missing ?u='); return; }
 
     const force    = normCharset(url.searchParams.get('force') || '');
-    const passthru = url.searchParams.get('passthru') === '1'; // 変換せず素通し
-    const rewrite  = url.searchParams.get('rewrite') !== '0';  // 相対→プロキシへ（既定ON）
+    const passthru = url.searchParams.get('passthru') === '1';
+    const rewrite  = url.searchParams.get('rewrite') !== '0';
 
     const upstreamUrl = buildUpstreamUrl(u);
 
-    // ★ メソッドとボディをそのまま中継（PAINT対策）
     const method = req.method || 'GET';
     let upstreamBody;
-    if (!['GET','HEAD'].includes(method)) {
-      upstreamBody = await readRawBody(req);
-    }
+    if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
 
     const upstreamRes = await fetch(upstreamUrl, {
       method,
@@ -172,6 +189,8 @@ module.exports = async function handler(req, res) {
         const proxied = buildProxyUrl(req, nextPathname);
         res.statusCode = upstreamRes.status;
         res.setHeader('Location', proxied);
+        // Set-Cookie もリダイレクト時に落ちがちなのでここでも処理
+        rewriteSetCookieHeaders(upstreamRes, req, res);
         res.end();
         return;
       }
@@ -181,7 +200,9 @@ module.exports = async function handler(req, res) {
     const pathname = new URL(upstreamUrl).pathname;
     const isHtml = isHtmlLike(ct, pathname);
 
-    // HTML以外は素通し（画像/CSS/JS/バイナリOK）
+    // ★ Set-Cookie を vercel 側に保存できるよう書き換え
+    rewriteSetCookieHeaders(upstreamRes, req, res);
+
     if (!isHtml || passthru) {
       const headers = sanitizeHeaders(upstreamRes.headers, { isHtml: false });
       for (const [k,v] of headers.entries()) res.setHeader(k, v);
@@ -196,7 +217,7 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    // ---- HTML: すべて読み込み → エンコ判定 → UTF-8化 ----
+    // ---- HTML：UTF-8化 ----
     const chunks = [];
     const reader = upstreamRes.body.getReader();
     while (true) {
@@ -217,10 +238,7 @@ module.exports = async function handler(req, res) {
       catch { htmlUtf8 = iconv.decode(buf, 'euc-jp'); }
     }
 
-    // meta を安全に utf-8 へ
     htmlUtf8 = rewriteMetaToUtf8(htmlUtf8);
-
-    // 相対URLをプロキシURLへ
     if (rewrite) htmlUtf8 = rewriteAssetUrls(htmlUtf8, upstreamUrl, req);
 
     const headers = sanitizeHeaders(upstreamRes.headers, { isHtml: true, finalCharset: 'utf-8' });
