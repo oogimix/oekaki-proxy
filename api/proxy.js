@@ -1,6 +1,29 @@
 // api/proxy.js
 // Vercel Serverless (Node / CommonJS)
+// --- add: nested proxy?u= ... un-wrapper ---
+function unwrapProxyParam(uRaw) {
+  let s = String(uRaw || '');
+  // 3回まで剥がす（十分）
+  for (let i = 0; i < 3; i++) {
+    // 形式A: "proxy?u=...."
+    const m = s.match(/^proxy\?u=(.+)$/);
+    if (m) { s = decodeURIComponent(m[1]); continue; }
 
+    // 形式B: "/api/proxy?u=...." など
+    try {
+      const tmp = new URL(s, 'https://dummy.local/');
+      const path = tmp.pathname.replace(/^\/+/, '');
+      if ((path === 'api/proxy' || path === 'proxy') && tmp.searchParams.has('u')) {
+        s = decodeURIComponent(tmp.searchParams.get('u'));
+        continue;
+      }
+    } catch {
+      // s が相対でもOK、次へ
+    }
+    break;
+  }
+  return s;
+}
 const iconv = require('iconv-lite');
 require('iconv-lite/encodings');
 
