@@ -1,15 +1,17 @@
 // api/proxy.js
-// Vercel Serverless (Node / CommonJS)
-// --- add: nested proxy?u= ... un-wrapper ---
+// Vercel Serverless (Node / CommonJS) — SAFE baseline, no runtime injection
+
+const iconv = require('iconv-lite');
+require('iconv-lite/encodings');
+
+const UPSTREAM_ORIGIN = 'https://sush1h4mst3r.stars.ne.jp/';
+
+// --- unwrap nested proxy?u=... once and for all (up to 3 layers)
 function unwrapProxyParam(uRaw) {
   let s = String(uRaw || '');
-  // 3回まで剥がす（十分）
   for (let i = 0; i < 3; i++) {
-    // 形式A: "proxy?u=...."
     const m = s.match(/^proxy\?u=(.+)$/);
     if (m) { s = decodeURIComponent(m[1]); continue; }
-
-    // 形式B: "/api/proxy?u=...." など
     try {
       const tmp = new URL(s, 'https://dummy.local/');
       const path = tmp.pathname.replace(/^\/+/, '');
@@ -17,17 +19,11 @@ function unwrapProxyParam(uRaw) {
         s = decodeURIComponent(tmp.searchParams.get('u'));
         continue;
       }
-    } catch {
-      // s が相対でもOK、次へ
-    }
+    } catch {}
     break;
   }
   return s;
 }
-const iconv = require('iconv-lite');
-require('iconv-lite/encodings');
-
-const UPSTREAM_ORIGIN = 'https://sush1h4mst3r.stars.ne.jp/';
 
 // ---------- helpers ----------
 function buildSelfOrigin(req) {
@@ -117,6 +113,7 @@ function rewriteSetCookieHeaders(upstreamRes, req, res) {
     return s;
   });
 
+  // 代理ジャー pb_up にも上流クッキーを同梱
   const pairs = setCookies.map(c=>String(c).split(';',1)[0]).filter(Boolean);
   if (pairs.length){
     const jarValue = encodeURIComponent(pairs.join('; '));
@@ -126,7 +123,7 @@ function rewriteSetCookieHeaders(upstreamRes, req, res) {
   res.setHeader('Set-Cookie', rewritten);
 }
 
-// ---------- meta & URL rewriting ----------
+// ---------- meta & URL rewriting (静的) ----------
 function rewriteMetaToUtf8(html){
   let out = html;
   out = out.replace(/<meta([^>]*?)\bcharset\s*=\s*(['"]?)[^"'>\s;]+(\2)([^>]*)>/ig, '<meta$1charset="utf-8"$4>');
@@ -146,7 +143,7 @@ function toProxyUrl(selfOrigin, absUpstreamUrl){
 function rewriteAssetUrls(html, htmlAbsUrl, req){
   const selfOrigin = buildSelfOrigin(req);
   const SKIP=/^(data:|javascript:|mailto:|about:)/i;
-  // ★ action は書き換えない（動的フックでやる）←二重包み対策
+  // フォーム action は触らない（JSで上流がいじるので）
   return html.replace(/\b(href|src|data|poster)\s*=\s*("([^"]+)"|'([^']+)'|([^"'=\s>]+))/ig,
     (m,attr,_qv,dq,sq,bare)=>{
       const val = dq ?? sq ?? bare ?? '';
@@ -158,106 +155,13 @@ function rewriteAssetUrls(html, htmlAbsUrl, req){
       return `${attr}=${quote}${prox}${quote}`;
     });
 }
-function injectRuntimeRewriter(html, upstreamAbs, req){
-  const selfOrigin = buildSelfOrigin(req);
-  const up = new URL(upstreamAbs);
-  const upBase = up.origin + up.pathname.replace(/[^/]*$/,'');
-  const js = `
-<script>(function(){
-  var SELF=${JSON.stringify(selfOrigin)};
-  var UP_ORIGIN=${JSON.stringify(up.origin)};
-  var UP_BASE=${JSON.stringify(upBase)};
-  function toProxy(u){
-    try{
-      // 既に proxy?u=... 形式なら二重包みしない（相対ならSELFを付与）
-      var raw=String(u);
-      if (/^(?:\\/??api\\/)?proxy\\?u=/.test(raw)) {
-        return raw.startsWith('http') ? raw : (raw.startsWith('/') ? (SELF+raw) : (SELF+'/'+raw));
-      }
-
-      var abs=new URL(u,UP_BASE).toString();
-      if(abs.startsWith(UP_ORIGIN)){
-        var rel=abs.replace(UP_ORIGIN+"/","");
-        return SELF+"/api/proxy?u="+encodeURIComponent(rel);
-      }
-      if(abs.startsWith(SELF+"/api/")){
-        var path=abs.substring((SELF+"/api/").length);
-        var upGuess=new URL(path,UP_BASE).toString();
-        if(upGuess.startsWith(UP_ORIGIN)){
-          var rel2=upGuess.replace(UP_ORIGIN+"/","");
-          return SELF+"/api/proxy?u="+encodeURIComponent(rel2);
-        }
-      }
-      return abs;
-    }catch(e){ return u; }
-  }
-  function fixAll(){
-    document.querySelectorAll("a[href]").forEach(function(a){
-      var h=a.getAttribute("href");
-      if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)) a.setAttribute("href",toProxy(h));
-    });
-    document.querySelectorAll("form").forEach(function(f){
-      var act=f.getAttribute("action")||"potiboard.php";
-      if(!/^https?:/i.test(act)) f.setAttribute("action",toProxy(act));
-      f.addEventListener("submit",function(){
-        var a=f.getAttribute("action")||f.action||"potiboard.php";
-        try{ f.action=toProxy(a); }catch(_){}
-      },true);
-    });
-  }
-  if(window.fetch){
-    var _f=window.fetch;
-    window.fetch=function(input,init){
-      try{
-        if(typeof input==="string") input=toProxy(input);
-        else if (input && input.url){ var u=toProxy(input.url); input=new Request(u,input); }
-      }catch(e){}
-      return _f(input,init);
-    };
-  }
-  if(window.XMLHttpRequest){
-    var _o=XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open=function(m,u){
-      try{ u=toProxy(u);}catch(e){}
-      return _o.apply(this,[m,u].concat([].slice.call(arguments,2)));
-    };
-  }
-  var mo=new MutationObserver(function(ms){
-    ms.forEach(function(m){
-      (m.addedNodes||[]).forEach(function(n){
-        if(n.nodeType!==1) return;
-        if(n.matches&&n.matches("a[href]")){
-          var h=n.getAttribute("href");
-          if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)) n.setAttribute("href",toProxy(h));
-        }
-        n.querySelectorAll&&n.querySelectorAll("a[href],form").forEach(function(el){
-          if(el.tagName==="A"){
-            var h2=el.getAttribute("href");
-            if(h2 && !/^https?:|^data:|^mailto:|^javascript:/i.test(h2)) el.setAttribute("href",toProxy(h2));
-          }else if(el.tagName==="FORM"){
-            var a2=el.getAttribute("action")||"potiboard.php";
-            if(!/^https?:/i.test(a2)) el.setAttribute("action",toProxy(a2));
-            el.addEventListener("submit",function(){
-              var a3=el.getAttribute("action")||el.action||"potiboard.php";
-              try{ el.action=toProxy(a3);}catch(_){}
-            },true);
-          }
-        });
-      });
-    });
-  });
-  mo.observe(document.documentElement,{subtree:true,childList:true});
-  if(document.readyState!=="loading") fixAll();
-  else document.addEventListener("DOMContentLoaded",fixAll,{once:true});
-})();</script>`;
-  return html.replace(/<\/body/i, js + "\n</body");
-}
 
 // ---------- main ----------
 module.exports = async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const u = url.searchParams.get('u');
+    // ★ ネスト解除してから扱う（404元凶の二重包みを解消）
+    const u = unwrapProxyParam(url.searchParams.get('u'));
     if (!u) { res.statusCode = 400; res.end('Missing ?u='); return; }
 
     const force    = normCharset(url.searchParams.get('force') || '');
@@ -271,7 +175,7 @@ module.exports = async function handler(req, res) {
     let upstreamBody;
     if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
 
-    // ---- merge cookie with jar(pb_up) ----
+    // ---- 代理ジャー（pb_up）を取り出して必ず同封 ----
     function pickCookie(name, cookieHeader) {
       if (!cookieHeader) return null;
       const esc = name.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,'\\$&');
@@ -282,7 +186,7 @@ module.exports = async function handler(req, res) {
     const jar = pickCookie('pb_up', clientCookieHeader);
     let mergedCookieForUpstream = clientCookieHeader || '';
     if (jar) {
-      const upstreamPairs = decodeURIComponent(jar);
+      const upstreamPairs = decodeURIComponent(jar); // "usercode=...; PHPSESSID=..."
       mergedCookieForUpstream = mergedCookieForUpstream
         ? `${mergedCookieForUpstream}; ${upstreamPairs}`
         : upstreamPairs;
@@ -304,7 +208,7 @@ module.exports = async function handler(req, res) {
       redirect: 'manual'
     });
 
-    // 30x redirect
+    // 30x redirect → プロキシ化
     if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
       const loc = upstreamRes.headers.get('location');
       if (loc) {
@@ -353,7 +257,6 @@ module.exports = async function handler(req, res) {
 
     htmlUtf8 = rewriteMetaToUtf8(htmlUtf8);
     if (rewrite) htmlUtf8 = rewriteAssetUrls(htmlUtf8, upstreamUrl, req);
-    htmlUtf8 = injectRuntimeRewriter(htmlUtf8, upstreamUrl, req);
 
     const headers = copyResponseHeaders(upstreamRes.headers, {isHtml:true, finalCharset:'utf-8'});
     for (const k in headers) res.setHeader(k, headers[k]);
