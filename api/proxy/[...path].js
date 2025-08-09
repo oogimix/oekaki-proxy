@@ -1,8 +1,7 @@
-// api/proxy/[...path].js
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   const upstreamBase = 'https://sush1h4mst3r.stars.ne.jp/';
 
-  // とりあえず何でも通す（あとで絞れます）
+  // まずは広め（あとでOriginを絞ってOK）
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,HEAD,OPTIONS');
@@ -14,14 +13,12 @@ module.exports = async (req, res) => {
   const qs = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
   const target = new URL(path + qs, upstreamBase).toString();
 
-  // 転送ヘッダをざっくり用意
   const hop = new Set(['host','connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade','content-length','accept-encoding']);
   const headers = {};
   for (const [k,v] of Object.entries(req.headers)) {
     if (!hop.has(k.toLowerCase())) headers[k] = v;
   }
 
-  // ボディ（POST想定）
   let body;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     const chunks = [];
@@ -37,7 +34,6 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // 埋め込みを邪魔するヘッダ除去＆Location調整
   res.status(upstream.status);
   upstream.headers.forEach((value, key) => {
     const k = key.toLowerCase();
@@ -57,4 +53,4 @@ module.exports = async (req, res) => {
 
   const buf = Buffer.from(await upstream.arrayBuffer());
   res.send(buf);
-};
+}
