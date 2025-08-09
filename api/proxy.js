@@ -1,13 +1,14 @@
 // api/proxy.js
 // Vercel Node (CommonJS)
 //
-// ✔ 上流(EUC-JP/CP932/ISO-2022-JP)→UTF-8再エンコード
+// ✔ 上流(EUC/CP932/ISO-2022-JP)→UTF-8再エンコード
 // ✔ <meta charset> を安全に utf-8 へ統一
 // ✔ href/src/action 等を /api/proxy?u=... に書き換え（静的）
-// ✔ POST/マルチパートのボディ中継（PAINT対策）
+// ✔ POST/マルチパートのボディ中継（PAINT/投稿用）
 // ✔ Set-Cookie を vercel 側に変換 (SameSite=None; Secure; Partitioned)
 // ✔ Referer/Origin を上流に合わせる
-// ✔ ★ 実行時に form/fetch/XHR をフックして送信先を強制プロキシ化（動的）
+// ✔ ★ 実行時に form/fetch/XHR をフック（動的）。さらに
+//     “/api/potiboard.php?...” に化けた絶対URLも強制で /api/proxy?u=… に矯正
 
 const iconv = require('iconv-lite');
 require('iconv-lite/encodings'); // ISO-2022-JP 有効化
@@ -90,15 +91,12 @@ function rewriteSetCookieHeaders(upstreamRes, req, res) {
   const rewritten = setCookies.map(line => {
     let s = line;
 
-    // Domain → vercel 側（無ければ付与）
     if (/;\s*Domain=/i.test(s)) s = s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
     else s += `; Domain=${host}`;
 
-    // Path は /
     if (/;\s*Path=/i.test(s)) s = s.replace(/;\s*Path=[^;]*/i, `; Path=/`);
     else s += `; Path=/`;
 
-    // 3rd-party iframe で有効化
     if (!/;\s*SameSite=/i.test(s))   s += '; SameSite=None';
     if (!/;\s*Secure/i.test(s))      s += '; Secure';
     if (!/;\s*Partitioned/i.test(s)) s += '; Partitioned';
@@ -155,7 +153,7 @@ function rewriteAssetUrls(html, htmlAbsUrl, req){
   );
 }
 
-// ---------- ランタイムの送信先強制プロキシ化（動的置換） ----------
+// ---------- ランタイム送信先 強制プロキシ化（動的置換＋/api/potiboard.php救済） ----------
 function injectRuntimeRewriter(html, upstreamAbs, req) {
   const selfOrigin = buildSelfOrigin(req);
   const up = new URL(upstreamAbs);
@@ -171,10 +169,23 @@ function injectRuntimeRewriter(html, upstreamAbs, req) {
   function toProxy(u){
     try{
       var abs=new URL(u, UP_BASE).toString();
+
+      // 1) 上流オリジン宛は通常のプロキシ化
       if(abs.startsWith(UP_ORIGIN)){
         var rel=abs.replace(UP_ORIGIN+"/","");
         return SELF+"/api/proxy?u="+encodeURIComponent(rel);
       }
+
+      // 2) ★ 自サイトの /api/potiboard.php?... もプロキシへ救済
+      if(abs.startsWith(SELF+"/api/")){
+        var path = abs.substring((SELF+"/api/").length); // 例: "potiboard.php?mode=saveimage..."
+        var upGuess = new URL(path, UP_BASE).toString(); // https://.../potiboard5/potiboard.php?...
+        if(upGuess.startsWith(UP_ORIGIN)){
+          var rel2 = upGuess.replace(UP_ORIGIN+"/","");
+          return SELF+"/api/proxy?u="+encodeURIComponent(rel2);
+        }
+      }
+
       return abs;
     }catch(e){ return u; }
   }
@@ -341,7 +352,6 @@ module.exports = async function handler(req, res) {
 
     htmlUtf8 = rewriteMetaToUtf8(htmlUtf8);
     if (rewrite) htmlUtf8 = rewriteAssetUrls(htmlUtf8, upstreamUrl, req);
-    // ★ 実行時の action/fetch/XHR も強制プロキシ化
     htmlUtf8 = injectRuntimeRewriter(htmlUtf8, upstreamUrl, req);
 
     const headers = sanitizeHeaders(upstreamRes.headers, { isHtml: true, finalCharset: 'utf-8' });
