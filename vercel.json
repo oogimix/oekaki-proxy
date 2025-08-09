@@ -1,6 +1,9 @@
 {
   "version": 2,
+  "functions": {
+    "api/proxy.js": { "maxDuration": 20, "memory": 1024 }
+  },
   "rewrites": [
-    { "source": "/api/proxy/(.*)", "destination": "/api/proxy?u=$1" }
+    { "source": "/(.*)", "destination": "/api/proxy?u=$1" }
   ]
 }
