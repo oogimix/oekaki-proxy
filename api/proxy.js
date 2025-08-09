@@ -1,16 +1,18 @@
 // api/proxy.js
 // Vercel Node (CommonJS)
 //
-// ・文字化け対策：上流(EUC/CP932/ISO-2022-JP)→UTF-8再エンコード
-// ・<meta charset> を安全に utf-8 へ統一
-// ・href/src/action 等の相対URL→ /api/proxy?u=... に書き換え
-// ・XFO/CSP, content-length, content-encoding を削除
-// ・POST/マルチパート等のボディ中継（PAINT用）
-// ・★ Set-Cookie を vercel 側へ書き換え保存（SameSite=None; Secure 付与）
+// ✔ 上流(EUC-JP/CP932/ISO-2022-JP)→UTF-8再エンコード
+// ✔ <meta charset> を安全に utf-8 へ統一
+// ✔ href/src/action 等の相対URL→ /api/proxy?u=... に書き換え
+// ✔ XFO/CSP, content-length, content-encoding を削除
+// ✔ POST/マルチパート等のボディ中継（PAINT用）
+// ✔ Set-Cookie を vercel 側へ書き換え (SameSite=None; Secure; Partitioned) して iframe でも送受信
+// ✔ Referer / Origin を上流に正しく合わせる
 
 const iconv = require('iconv-lite');
-require('iconv-lite/encodings'); // ISO-2022-JP 有効化
+require('iconv-lite/encodings'); // ISO-2022-JP などを有効化
 
+// 上流のオリジン（末尾 / 必須）
 const UPSTREAM_ORIGIN = 'https://sush1h4mst3r.stars.ne.jp/';
 
 // ---------- 基本ユーティリティ ----------
@@ -77,25 +79,36 @@ function sanitizeHeaders(h, { isHtml, finalCharset }) {
   return out;
 }
 
-// ---------- Set-Cookie 書き換え（重要） ----------
+// ---------- Set-Cookie 書き換え（Partitioned 対応） ----------
 function rewriteSetCookieHeaders(upstreamRes, req, res) {
-  // undici (Node fetch) では headers.raw() が使える
   const raw = upstreamRes.headers.raw?.() || {};
   const setCookies = raw['set-cookie'] || [];
   if (!setCookies.length) return;
 
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+
   const rewritten = setCookies.map(line => {
-    // Domain=... を vercel ホストに差し替え（または削除）
-    let s = line
-      .replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`)
-      .replace(/;\s*Path=[^;]*/i, '; Path=/'); // 広めに
+    let s = line;
 
-    // SameSite, Secure を強制
-    if (!/;\s*SameSite=/i.test(s)) s += '; SameSite=None';
-    if (!/;\s*Secure/i.test(s))    s += '; Secure';
+    // Domain を vercel 側に寄せる（無ければ付与）
+    if (/;\s*Domain=/i.test(s)) {
+      s = s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
+    } else {
+      s += `; Domain=${host}`;
+    }
 
-    // HttpOnly/Secure 等は上流のまま＋追記
+    // Path は広めに
+    if (/;\s*Path=/i.test(s)) {
+      s = s.replace(/;\s*Path=[^;]*/i, `; Path=/`);
+    } else {
+      s += `; Path=/`;
+    }
+
+    // 3rd-party iframe でも効くよう CHIPS + SameSite=None + Secure
+    if (!/;\s*SameSite=/i.test(s))   s += '; SameSite=None';
+    if (!/;\s*Secure/i.test(s))      s += '; Secure';
+    if (!/;\s*Partitioned/i.test(s)) s += '; Partitioned';
+
     return s;
   });
 
@@ -160,7 +173,9 @@ module.exports = async function handler(req, res) {
     const rewrite  = url.searchParams.get('rewrite') !== '0';
 
     const upstreamUrl = buildUpstreamUrl(u);
+    const upstreamOrigin = new URL(upstreamUrl).origin;
 
+    // メソッド/ボディ中継（PAINT対策）
     const method = req.method || 'GET';
     let upstreamBody;
     if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
@@ -171,7 +186,9 @@ module.exports = async function handler(req, res) {
         'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
         'Accept': req.headers['accept'] || '*/*',
         'Accept-Language': req.headers['accept-language'] || 'ja,en-US;q=0.9,en;q=0.8',
-        'Referer': UPSTREAM_ORIGIN,
+        // 重要：押下元ページをRefererに、Originも上流に合わせる
+        'Referer': upstreamUrl,
+        'Origin': upstreamOrigin,
         'Accept-Encoding': 'identity',
         ...(req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {}),
         ...(req.headers['cookie']       ? { 'Cookie': req.headers['cookie'] } : {})
@@ -189,7 +206,7 @@ module.exports = async function handler(req, res) {
         const proxied = buildProxyUrl(req, nextPathname);
         res.statusCode = upstreamRes.status;
         res.setHeader('Location', proxied);
-        // Set-Cookie もリダイレクト時に落ちがちなのでここでも処理
+        // リダイレクト時の Set-Cookie も拾う
         rewriteSetCookieHeaders(upstreamRes, req, res);
         res.end();
         return;
@@ -200,7 +217,7 @@ module.exports = async function handler(req, res) {
     const pathname = new URL(upstreamUrl).pathname;
     const isHtml = isHtmlLike(ct, pathname);
 
-    // ★ Set-Cookie を vercel 側に保存できるよう書き換え
+    // ★ Set-Cookie を vercel 側で保存できるよう書き換え
     rewriteSetCookieHeaders(upstreamRes, req, res);
 
     if (!isHtml || passthru) {
