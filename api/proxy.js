@@ -3,16 +3,15 @@
 //
 // ✔ 上流(EUC-JP/CP932/ISO-2022-JP)→UTF-8再エンコード
 // ✔ <meta charset> を安全に utf-8 へ統一
-// ✔ href/src/action 等の相対URL→ /api/proxy?u=... に書き換え
-// ✔ XFO/CSP, content-length, content-encoding を削除
-// ✔ POST/マルチパート等のボディ中継（PAINT用）
-// ✔ Set-Cookie を vercel 側へ書き換え (SameSite=None; Secure; Partitioned) して iframe でも送受信
-// ✔ Referer / Origin を上流に正しく合わせる
+// ✔ href/src/action 等を /api/proxy?u=... に書き換え（静的）
+// ✔ POST/マルチパートのボディ中継（PAINT対策）
+// ✔ Set-Cookie を vercel 側に変換 (SameSite=None; Secure; Partitioned)
+// ✔ Referer/Origin を上流に合わせる
+// ✔ ★ 実行時に form/fetch/XHR をフックして送信先を強制プロキシ化（動的）
 
 const iconv = require('iconv-lite');
-require('iconv-lite/encodings'); // ISO-2022-JP などを有効化
+require('iconv-lite/encodings'); // ISO-2022-JP 有効化
 
-// 上流のオリジン（末尾 / 必須）
 const UPSTREAM_ORIGIN = 'https://sush1h4mst3r.stars.ne.jp/';
 
 // ---------- 基本ユーティリティ ----------
@@ -39,11 +38,12 @@ function readRawBody(req) {
   });
 }
 
-// ---------- 文字コード ----------
+// ---------- エンコード判定 ----------
 const ALIAS = new Map([
   ['utf8','utf-8'], ['utf-8','utf-8'],
   ['eucjp','euc-jp'], ['euc-jp','euc-jp'], ['euc_jp','euc-jp'],
-  ['shift_jis','cp932'], ['shift-jis','cp932'], ['sjis','cp932'], ['cp932','cp932'], ['ms932','cp932'],
+  ['shift_jis','cp932'], ['shift-jis','cp932'], ['sjis','cp932'],
+  ['cp932','cp932'], ['ms932','cp932'],
   ['iso-2022-jp','iso-2022-jp'], ['jis','iso-2022-jp'], ['iso2022jp','iso-2022-jp']
 ]);
 function normCharset(v=''){ const k=v.toLowerCase().trim(); return ALIAS.get(k)||k; }
@@ -79,7 +79,7 @@ function sanitizeHeaders(h, { isHtml, finalCharset }) {
   return out;
 }
 
-// ---------- Set-Cookie 書き換え（Partitioned 対応） ----------
+// ---------- Set-Cookie 書き換え（Partitioned） ----------
 function rewriteSetCookieHeaders(upstreamRes, req, res) {
   const raw = upstreamRes.headers.raw?.() || {};
   const setCookies = raw['set-cookie'] || [];
@@ -90,21 +90,15 @@ function rewriteSetCookieHeaders(upstreamRes, req, res) {
   const rewritten = setCookies.map(line => {
     let s = line;
 
-    // Domain を vercel 側に寄せる（無ければ付与）
-    if (/;\s*Domain=/i.test(s)) {
-      s = s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
-    } else {
-      s += `; Domain=${host}`;
-    }
+    // Domain → vercel 側（無ければ付与）
+    if (/;\s*Domain=/i.test(s)) s = s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
+    else s += `; Domain=${host}`;
 
-    // Path は広めに
-    if (/;\s*Path=/i.test(s)) {
-      s = s.replace(/;\s*Path=[^;]*/i, `; Path=/`);
-    } else {
-      s += `; Path=/`;
-    }
+    // Path は /
+    if (/;\s*Path=/i.test(s)) s = s.replace(/;\s*Path=[^;]*/i, `; Path=/`);
+    else s += `; Path=/`;
 
-    // 3rd-party iframe でも効くよう CHIPS + SameSite=None + Secure
+    // 3rd-party iframe で有効化
     if (!/;\s*SameSite=/i.test(s))   s += '; SameSite=None';
     if (!/;\s*Secure/i.test(s))      s += '; Secure';
     if (!/;\s*Partitioned/i.test(s)) s += '; Partitioned';
@@ -115,7 +109,7 @@ function rewriteSetCookieHeaders(upstreamRes, req, res) {
   res.setHeader('Set-Cookie', rewritten);
 }
 
-// ---------- meta charset を安全に utf-8 へ ----------
+// ---------- meta charset 補正 ----------
 function rewriteMetaToUtf8(html) {
   let out = html;
   out = out.replace(
@@ -132,7 +126,7 @@ function rewriteMetaToUtf8(html) {
   return out;
 }
 
-// ---------- 相対URL→プロキシURL ----------
+// ---------- 相対URL → プロキシURL（静的置換） ----------
 function absolutizeToUpstream(u, baseAbs){
   try { return new URL(u, baseAbs).toString(); } catch { return null; }
 }
@@ -161,6 +155,98 @@ function rewriteAssetUrls(html, htmlAbsUrl, req){
   );
 }
 
+// ---------- ランタイムの送信先強制プロキシ化（動的置換） ----------
+function injectRuntimeRewriter(html, upstreamAbs, req) {
+  const selfOrigin = buildSelfOrigin(req);
+  const up = new URL(upstreamAbs);
+  const upBase = up.origin + up.pathname.replace(/[^/]*$/, ''); // ディレクトリ
+
+  const js = `
+<script>
+(function(){
+  var SELF=${JSON.stringify(selfOrigin)};
+  var UP_ORIGIN=${JSON.stringify(up.origin)};
+  var UP_BASE=${JSON.stringify(upBase)};
+
+  function toProxy(u){
+    try{
+      var abs=new URL(u, UP_BASE).toString();
+      if(abs.startsWith(UP_ORIGIN)){
+        var rel=abs.replace(UP_ORIGIN+"/","");
+        return SELF+"/api/proxy?u="+encodeURIComponent(rel);
+      }
+      return abs;
+    }catch(e){ return u; }
+  }
+
+  function fixAll(){
+    document.querySelectorAll("a[href]").forEach(function(a){
+      var h=a.getAttribute("href");
+      if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)){
+        a.setAttribute("href", toProxy(h));
+      }
+    });
+    document.querySelectorAll("form").forEach(function(f){
+      var act=f.getAttribute("action")||"potiboard.php";
+      if(!/^https?:/i.test(act)) f.setAttribute("action", toProxy(act));
+      f.addEventListener("submit", function(){
+        var a=f.getAttribute("action")||f.action||"potiboard.php";
+        try{ f.action = toProxy(a); }catch(_){}
+      }, true);
+    });
+  }
+
+  if (window.fetch){
+    var _fetch=window.fetch;
+    window.fetch=function(input, init){
+      try{
+        if (typeof input==="string") input=toProxy(input);
+        else if (input && input.url){ var u=toProxy(input.url); input=new Request(u, input); }
+      }catch(e){}
+      return _fetch(input, init);
+    };
+  }
+  if (window.XMLHttpRequest){
+    var _open=XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open=function(m,u){
+      try{ u=toProxy(u); }catch(e){}
+      return _open.apply(this, [m,u].concat([].slice.call(arguments,2)));
+    };
+  }
+
+  var mo=new MutationObserver(function(muts){
+    muts.forEach(function(m){
+      m.addedNodes && m.addedNodes.forEach(function(n){
+        if(n.nodeType!==1) return;
+        if(n.matches && n.matches("a[href]")){
+          var h=n.getAttribute("href");
+          if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)) n.setAttribute("href", toProxy(h));
+        }
+        n.querySelectorAll && n.querySelectorAll("a[href],form").forEach(function(el){
+          if(el.tagName==="A"){
+            var h2=el.getAttribute("href");
+            if(h2 && !/^https?:|^data:|^mailto:|^javascript:/i.test(h2)) el.setAttribute("href", toProxy(h2));
+          }else if(el.tagName==="FORM"){
+            var a2=el.getAttribute("action")||"potiboard.php";
+            if(!/^https?:/i.test(a2)) el.setAttribute("action", toProxy(a2));
+            el.addEventListener("submit", function(){
+              var a3=el.getAttribute("action")||el.action||"potiboard.php";
+              try{ el.action = toProxy(a3); }catch(_){}
+            }, true);
+          }
+        });
+      });
+    });
+  });
+  mo.observe(document.documentElement, {subtree:true, childList:true});
+
+  if(document.readyState!=="loading") fixAll();
+  else document.addEventListener("DOMContentLoaded", fixAll, {once:true});
+})();
+</script>`;
+  return html.replace(/<\/body/i, js + "\n</body");
+}
+
 // ---------- メイン ----------
 module.exports = async function handler(req, res) {
   try {
@@ -175,7 +261,7 @@ module.exports = async function handler(req, res) {
     const upstreamUrl = buildUpstreamUrl(u);
     const upstreamOrigin = new URL(upstreamUrl).origin;
 
-    // メソッド/ボディ中継（PAINT対策）
+    // メソッド/ボディ中継（PAINT/投稿用）
     const method = req.method || 'GET';
     let upstreamBody;
     if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
@@ -186,9 +272,8 @@ module.exports = async function handler(req, res) {
         'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
         'Accept': req.headers['accept'] || '*/*',
         'Accept-Language': req.headers['accept-language'] || 'ja,en-US;q=0.9,en;q=0.8',
-        // 重要：押下元ページをRefererに、Originも上流に合わせる
-        'Referer': upstreamUrl,
-        'Origin': upstreamOrigin,
+        'Referer': upstreamUrl,              // 押下元ページに合わせる
+        'Origin':  upstreamOrigin,
         'Accept-Encoding': 'identity',
         ...(req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {}),
         ...(req.headers['cookie']       ? { 'Cookie': req.headers['cookie'] } : {})
@@ -197,7 +282,7 @@ module.exports = async function handler(req, res) {
       redirect: 'manual'
     });
 
-    // 30x: Location を可能な範囲でプロキシ化
+    // 30x: Location をプロキシ化
     if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
       const loc = upstreamRes.headers.get('location');
       if (loc) {
@@ -206,7 +291,6 @@ module.exports = async function handler(req, res) {
         const proxied = buildProxyUrl(req, nextPathname);
         res.statusCode = upstreamRes.status;
         res.setHeader('Location', proxied);
-        // リダイレクト時の Set-Cookie も拾う
         rewriteSetCookieHeaders(upstreamRes, req, res);
         res.end();
         return;
@@ -217,7 +301,7 @@ module.exports = async function handler(req, res) {
     const pathname = new URL(upstreamUrl).pathname;
     const isHtml = isHtmlLike(ct, pathname);
 
-    // ★ Set-Cookie を vercel 側で保存できるよう書き換え
+    // Set-Cookie を vercel 側に保存できるよう書き換え
     rewriteSetCookieHeaders(upstreamRes, req, res);
 
     if (!isHtml || passthru) {
@@ -257,6 +341,8 @@ module.exports = async function handler(req, res) {
 
     htmlUtf8 = rewriteMetaToUtf8(htmlUtf8);
     if (rewrite) htmlUtf8 = rewriteAssetUrls(htmlUtf8, upstreamUrl, req);
+    // ★ 実行時の action/fetch/XHR も強制プロキシ化
+    htmlUtf8 = injectRuntimeRewriter(htmlUtf8, upstreamUrl, req);
 
     const headers = sanitizeHeaders(upstreamRes.headers, { isHtml: true, finalCharset: 'utf-8' });
     for (const [k,v] of headers.entries()) res.setHeader(k, v);
