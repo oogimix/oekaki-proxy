@@ -1,6 +1,6 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/potiboard5/(.*)", "destination": "/api/proxy/potiboard5/$1" }
+    { "source": "/api/proxy/(.*)", "destination": "/api/proxy?u=$1" }
   ]
 }
