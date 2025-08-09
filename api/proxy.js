@@ -1,5 +1,16 @@
 // api/proxy.js
-// StarServer 上の POTI-board を Vercel 経由で中継
+// StarServer 上の POTI-board を Vercel 経由で中継する完全版プロキシ
+// - iframe許可 (CSP frame-ancestors)
+// - X-Frame-Options/CSP 剥がし
+// - 相対URLの絶対化（“そのページの上流URL”基準）
+// - gzip無効化（content-encoding/content-length除去）
+// - Set-Cookie を自ドメイン化 + Path=/ + SameSite=None; Secure
+// - 302 の Location を自ドメインに張替
+// - NEO の saveimage(POST) は 200 'ok' を返して成功扱いに正規化
+// - HTTPS→失敗時HTTPフォールバック
+// - OPTIONS(CORS) 即応答
+// - デバッグ: __debug=1 でテキスト出力（必要なら）
+
 const ORIGIN_HOST = 'sush1h4mst3r.stars.ne.jp';
 const DEFAULT_PATH = '/potiboard5/potiboard.php';
 
@@ -16,10 +27,13 @@ const getSetCookies = (h) => {
 
 // 相対URLを “そのページの上流URL” 基準で解決し、プロキシ経由の絶対URLへ
 function rewriteHtml(html, host, upstreamPageUrl) {
-  const base = new URL(upstreamPageUrl);
+  let base;
+  try { base = new URL(upstreamPageUrl); } catch { return html; }
+
   // 新規タブ抑止
   html = html.replace(/target=["']?_blank["']?/gi, '');
-  // href/src/action を絶対化→プロキシへ
+
+  // href/src/action の相対を base で解決 → プロキシの同パスへ
   html = html.replace(
     /(href|src|action)=["'](?!https?:\/\/|data:|mailto:|javascript:)([^"']+)["']/gi,
     (_, attr, p) => {
@@ -28,6 +42,7 @@ function rewriteHtml(html, host, upstreamPageUrl) {
       return `${attr}="${proxied}"`;
     }
   );
+
   return html;
 }
 
@@ -44,7 +59,7 @@ module.exports = async (req, res) => {
   const q = req.query || {};
   const debug = '__debug' in q || 'debug' in q;
 
-  // CORS preflight
+  // CORS preflight（念のため）
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     res.setHeader('access-control-allow-origin', 'https://sushihamster.com');
@@ -102,6 +117,7 @@ module.exports = async (req, res) => {
       if (key === 'content-length') return;          // 長さは付け直さない
       out[k] = v;
     });
+
     // 親オリジン許可（開発含む）& キャッシュ無効
     out['content-security-policy'] =
       "frame-ancestors https://sushihamster.com https://*.sushihamster.com https://*.github.io http://localhost:* http://127.0.0.1:*";
@@ -109,7 +125,7 @@ module.exports = async (req, res) => {
     out['access-control-allow-credentials'] = 'true';
     out['cache-control'] = 'no-store';
 
-    // Set-Cookie を自ドメインに（Path=/ 強制 & SameSite=None; Secure）
+    // Set-Cookie → 自ドメインに（Path=/ 強制 & SameSite=None; Secure）
     const sc = getSetCookies(r.headers);
     if (sc.length) {
       out['set-cookie'] = sc.map((line) => {
@@ -121,7 +137,21 @@ module.exports = async (req, res) => {
       });
     }
 
-    // デバッグ時：リダイレクトの中身を可視化
+    // ---- ここが NEO 特有：saveimage POST は 200 'ok' に正規化 ----
+    const urlObj = new URL(upstreamUrl);
+    const isSaveImagePost =
+      req.method === 'POST' &&
+      /potiboard\.php$/i.test(urlObj.pathname) &&
+      /(?:^|&)mode=saveimage(?:&|$)/i.test(urlObj.search);
+
+    if (isSaveImagePost && isRedirect(r.status)) {
+      // 上流の Set-Cookie などは out に反映済み。本文は 'ok' を返す
+      res.writeHead(200, { ...out, 'content-type': 'text/plain; charset=utf-8' });
+      return res.end('ok');
+    }
+    // ------------------------------------------------------------
+
+    // デバッグ時：リダイレクト内容を可視化
     const redir = isRedirect(r.status);
     if (debug && redir) {
       const loc = r.headers.get('location') || '(none)';
@@ -159,7 +189,7 @@ module.exports = async (req, res) => {
 
     if (/text\/html/i.test(ct)) {
       let html = buf.toString('utf8');
-      html = rewriteHtml(html, req.headers.host, upstreamUrl); // ← base を上流URLに
+      html = rewriteHtml(html, req.headers.host, upstreamUrl);
       out['content-type'] = 'text/html; charset=utf-8';
       res.writeHead(200, out);
       return res.end(html);
