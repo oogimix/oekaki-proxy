@@ -1,22 +1,12 @@
 // api/proxy.js
-// Vercel Node (CommonJS)
-//
-// ✔ 上流(EUC-JP/CP932/ISO-2022-JP)→UTF-8再エンコード
-// ✔ <meta charset> を安全に utf-8 へ統一
-// ✔ href/src/action 等を /api/proxy?u=... に書き換え（静的）
-// ✔ POST/マルチパートのボディ中継（PAINT/投稿）
-// ✔ Set-Cookie を vercel 側に変換 (SameSite=None; Secure; Partitioned)
-// ✔ ★ 上流 Set-Cookie をまとめた「代理ジャー pb_up」を発行し、以後のリクエストで必ず上流へ同封
-// ✔ Referer/Origin を上流に合わせる
-// ✔ 実行時に form/fetch/XHR をフックして送信先を強制プロキシ化（動的）
-// ✔ “/api/potiboard.php?...” に化けたURLも送信直前に強制救済
+// Vercel Serverless (Node / CommonJS)
 
 const iconv = require('iconv-lite');
-require('iconv-lite/encodings'); // ISO-2022-JP 有効化
+require('iconv-lite/encodings');
 
 const UPSTREAM_ORIGIN = 'https://sush1h4mst3r.stars.ne.jp/';
 
-// ---------- 基本ユーティリティ ----------
+// ---------- helpers ----------
 function buildSelfOrigin(req) {
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host  = (req.headers['x-forwarded-host']  || req.headers.host || '').split(',')[0].trim();
@@ -24,23 +14,31 @@ function buildSelfOrigin(req) {
 }
 function buildUpstreamUrl(u) {
   try { return new URL(u).toString(); }
-  catch { return new URL(u.replace(/^\//, ''), UPSTREAM_ORIGIN).toString(); }
+  catch { return new URL(u.replace(/^\//,''), UPSTREAM_ORIGIN).toString(); }
 }
 function buildProxyUrl(req, nextPathname) {
   const origin = buildSelfOrigin(req);
-  const uParam = encodeURIComponent(nextPathname.replace(/^\//, ''));
+  const uParam = encodeURIComponent(nextPathname.replace(/^\//,''));
   return `${origin}/api/proxy?u=${uParam}`;
 }
-function readRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', c => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on('end',  () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+function readRawBody(req){
+  return new Promise((resolve,reject)=>{
+    const chunks=[]; req.on('data',c=>chunks.push(Buffer.isBuffer(c)?c:Buffer.from(c)));
+    req.on('end',()=>resolve(Buffer.concat(chunks))); req.on('error',reject);
   });
 }
+function getSetCookiesArray(res) {
+  // undici >=18: getSetCookie(); それ以外: get('set-cookie'); なければ []
+  if (typeof res.headers.getSetCookie === 'function') {
+    try { return res.headers.getSetCookie(); } catch {}
+  }
+  const sc = res.headers.get('set-cookie');
+  if (!sc) return [];
+  // 複数が結合されてる可能性は小さいが、念のためセミコロンと区別つかないので1本扱い
+  return Array.isArray(sc) ? sc : [sc];
+}
 
-// ---------- エンコード判定 ----------
+// ---------- charset detect ----------
 const ALIAS = new Map([
   ['utf8','utf-8'], ['utf-8','utf-8'],
   ['eucjp','euc-jp'], ['euc-jp','euc-jp'], ['euc_jp','euc-jp'],
@@ -66,206 +64,171 @@ function detectFromBytes(buf){
 }
 function isHtmlLike(contentType, pathname){
   if (contentType && /text\/html/i.test(contentType)) return true;
-  const p = (pathname||'').toLowerCase();
-  return p.endsWith('.html') || p.endsWith('.htm') || p.endsWith('.php') || p.endsWith('/');
+  const p=(pathname||'').toLowerCase();
+  return p.endsWith('.html')||p.endsWith('.htm')||p.endsWith('.php')||p.endsWith('/');
 }
 
-// ---------- レスポンスヘッダ整形 ----------
-function sanitizeHeaders(h, { isHtml, finalCharset }) {
-  const out = new Headers();
-  for (const [k,v] of h.entries()) out.set(k, v);
+// ---------- headers util ----------
+function copyResponseHeaders(srcHeaders, {isHtml, finalCharset}) {
+  const out = {};
+  for (const [k,v] of srcHeaders.entries()) out[k.toLowerCase()] = v;
+  // remove problematic
   ['x-frame-options','content-security-policy','content-length','content-encoding','transfer-encoding']
-    .forEach(k => out.delete(k));
-  if (isHtml) out.set('content-type', `text/html; charset=${finalCharset || 'utf-8'}`);
-  out.set('access-control-allow-origin', '*');
+    .forEach(k=>{ delete out[k]; });
+  if (isHtml) out['content-type'] = `text/html; charset=${finalCharset||'utf-8'}`;
+  out['access-control-allow-origin'] = '*';
   return out;
 }
 
-// ---------- Set-Cookie 書き換え + 代理ジャー ----------
+// ---------- Set-Cookie rewrite + jar ----------
 function rewriteSetCookieHeaders(upstreamRes, req, res) {
-  const raw = upstreamRes.headers.raw?.() || {};
-  const setCookies = raw['set-cookie'] || [];
-  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-
+  const setCookies = getSetCookiesArray(upstreamRes);
   if (!setCookies.length) return;
 
-  // 1) 個別 Set-Cookie を iframe で効く属性に補強
-  const rewritten = setCookies.map(line => {
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+
+  const rewritten = setCookies.map(line=>{
     let s = String(line);
-    if (/;\s*Domain=/i.test(s)) s = s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
-    else s += `; Domain=${host}`;
-    if (/;\s*Path=/i.test(s)) s = s.replace(/;\s*Path=[^;]*/i, `; Path=/`);
-    else s += `; Path=/`;
+    s = /;\s*Domain=/i.test(s) ? s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`) : `${s}; Domain=${host}`;
+    s = /;\s*Path=/i.test(s)   ? s.replace(/;\s*Path=[^;]*/i, `; Path=/`)      : `${s}; Path=/`;
     if (!/;\s*SameSite=/i.test(s))   s += '; SameSite=None';
     if (!/;\s*Secure/i.test(s))      s += '; Secure';
     if (!/;\s*Partitioned/i.test(s)) s += '; Partitioned';
     return s;
   });
 
-  // 2) 上流クッキーをまとめた「代理ジャー pb_up」を保存（URLエンコードで格納）
-  const pairs = setCookies.map(c => String(c).split(';',1)[0]).filter(Boolean); // "name=value"
-  if (pairs.length) {
-    const jarValue = encodeURIComponent(pairs.join('; ')); // "a=1; b=2"
-    rewritten.push(
-      `pb_up=${jarValue}; Path=/; Max-Age=31536000; SameSite=None; Secure; Partitioned; Domain=${host}`
-    );
+  // jar
+  const pairs = setCookies.map(c=>String(c).split(';',1)[0]).filter(Boolean);
+  if (pairs.length){
+    const jarValue = encodeURIComponent(pairs.join('; '));
+    rewritten.push(`pb_up=${jarValue}; Path=/; Max-Age=31536000; SameSite=None; Secure; Partitioned; Domain=${host}`);
   }
 
+  // set multiple Set-Cookie headers
   res.setHeader('Set-Cookie', rewritten);
 }
 
-// ---------- meta charset 補正 ----------
-function rewriteMetaToUtf8(html) {
+// ---------- meta & URL rewriting ----------
+function rewriteMetaToUtf8(html){
   let out = html;
-  out = out.replace(
-    /<meta([^>]*?)\bcharset\s*=\s*(['"]?)[^"'>\s;]+(\2)([^>]*)>/ig,
-    '<meta$1charset="utf-8"$4>'
-  );
-  out = out.replace(
-    /<meta([^>]*?\bhttp-equiv\s*=\s*(['"])content-type\2[^>]*?\bcontent\s*=\s*(['"][^"']*?\bcharset=))[^"'>\s;]+([^>]*?)>/ig,
-    '<meta$1utf-8$4>'
-  );
-  if (!/charset\s*=\s*["']?utf-8/i.test(out)) {
-    out = out.replace(/<head([^>]*)>/i, '<head$1>\n<meta charset="utf-8">');
-  }
+  out = out.replace(/<meta([^>]*?)\bcharset\s*=\s*(['"]?)[^"'>\s;]+(\2)([^>]*)>/ig, '<meta$1charset="utf-8"$4>');
+  out = out.replace(/<meta([^>]*?\bhttp-equiv\s*=\s*(['"])content-type\2[^>]*?\bcontent\s*=\s*(['"][^"']*?\bcharset=))[^"'>\s;]+([^>]*?)>/ig, '<meta$1utf-8$4>');
+  if (!/charset\s*=\s*["']?utf-8/i.test(out)) out = out.replace(/<head([^>]*)>/i, '<head$1>\n<meta charset="utf-8">');
   return out;
 }
-
-// ---------- 相対URL → プロキシURL（静的置換） ----------
-function absolutizeToUpstream(u, baseAbs){
-  try { return new URL(u, baseAbs).toString(); } catch { return null; }
-}
+function absolutizeToUpstream(u, baseAbs){ try { return new URL(u, baseAbs).toString(); } catch { return null; } }
 function toProxyUrl(selfOrigin, absUpstreamUrl){
   const base = new URL(UPSTREAM_ORIGIN);
   const abs  = new URL(absUpstreamUrl);
   let next = abs.href;
-  if (abs.origin === base.origin) next = abs.href.replace(UPSTREAM_ORIGIN, '');
-  const uParam = encodeURIComponent(next.replace(/^\//, ''));
+  if (abs.origin === base.origin) next = abs.href.replace(UPSTREAM_ORIGIN,'').replace(/^\/+/,'');
+  const uParam = encodeURIComponent(next);
   return `${selfOrigin}/api/proxy?u=${uParam}`;
 }
 function rewriteAssetUrls(html, htmlAbsUrl, req){
   const selfOrigin = buildSelfOrigin(req);
-  const SKIP = /^(data:|javascript:|mailto:|about:)/i;
-  return html.replace(
-    /\b(href|src|action|data|poster)\s*=\s*("([^"]+)"|'([^']+)'|([^"'=\s>]+))/ig,
-    (m, attr, _qv, dq, sq, bare) => {
+  const SKIP=/^(data:|javascript:|mailto:|about:)/i;
+  return html.replace(/\b(href|src|action|data|poster)\s*=\s*("([^"]+)"|'([^']+)'|([^"'=\s>]+))/ig,
+    (m,attr,_qv,dq,sq,bare)=>{
       const val = dq ?? sq ?? bare ?? '';
       if (!val || SKIP.test(val)) return m;
       const abs = absolutizeToUpstream(val, htmlAbsUrl);
       if (!abs) return m;
-      const proxied = toProxyUrl(selfOrigin, abs);
-      const quote = dq != null ? '"' : (sq != null ? "'" : '');
-      return `${attr}=${quote}${proxied}${quote}`;
-    }
-  );
+      const prox = toProxyUrl(selfOrigin, abs);
+      const quote = dq!=null?'"':(sq!=null?"'":'');
+      return `${attr}=${quote}${prox}${quote}`;
+    });
 }
-
-// ---------- ランタイム送信先 強制プロキシ化（動的置換＋/api/potiboard.php救済） ----------
-function injectRuntimeRewriter(html, upstreamAbs, req) {
+function injectRuntimeRewriter(html, upstreamAbs, req){
   const selfOrigin = buildSelfOrigin(req);
   const up = new URL(upstreamAbs);
-  const upBase = up.origin + up.pathname.replace(/[^/]*$/, ''); // ディレクトリ
-
+  const upBase = up.origin + up.pathname.replace(/[^/]*$/,'');
   const js = `
-<script>
-(function(){
+<script>(function(){
   var SELF=${JSON.stringify(selfOrigin)};
   var UP_ORIGIN=${JSON.stringify(up.origin)};
   var UP_BASE=${JSON.stringify(upBase)};
-
   function toProxy(u){
     try{
-      var abs=new URL(u, UP_BASE).toString();
-
-      // 1) 上流オリジン宛は通常のプロキシ化
+      var abs=new URL(u,UP_BASE).toString();
       if(abs.startsWith(UP_ORIGIN)){
         var rel=abs.replace(UP_ORIGIN+"/","");
         return SELF+"/api/proxy?u="+encodeURIComponent(rel);
       }
-
-      // 2) ★ 自サイトの /api/ に来た potiboard.php も上流に復元してプロキシへ
       if(abs.startsWith(SELF+"/api/")){
-        var path = abs.substring((SELF+"/api/").length); // 例: "potiboard.php?mode=saveimage..."
-        var upGuess = new URL(path, UP_BASE).toString(); // https://.../potiboard5/potiboard.php?...
+        var path=abs.substring((SELF+"/api/").length);
+        var upGuess=new URL(path,UP_BASE).toString();
         if(upGuess.startsWith(UP_ORIGIN)){
-          var rel2 = upGuess.replace(UP_ORIGIN+"/","");
+          var rel2=upGuess.replace(UP_ORIGIN+"/","");
           return SELF+"/api/proxy?u="+encodeURIComponent(rel2);
         }
       }
-
       return abs;
     }catch(e){ return u; }
   }
-
   function fixAll(){
     document.querySelectorAll("a[href]").forEach(function(a){
       var h=a.getAttribute("href");
-      if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)){
-        a.setAttribute("href", toProxy(h));
-      }
+      if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)) a.setAttribute("href",toProxy(h));
     });
     document.querySelectorAll("form").forEach(function(f){
       var act=f.getAttribute("action")||"potiboard.php";
-      if(!/^https?:/i.test(act)) f.setAttribute("action", toProxy(act));
-      f.addEventListener("submit", function(){
+      if(!/^https?:/i.test(act)) f.setAttribute("action",toProxy(act));
+      f.addEventListener("submit",function(){
         var a=f.getAttribute("action")||f.action||"potiboard.php";
-        try{ f.action = toProxy(a); }catch(_){}
-      }, true);
+        try{ f.action=toProxy(a); }catch(_){}
+      },true);
     });
   }
-
-  if (window.fetch){
-    var _fetch=window.fetch;
-    window.fetch=function(input, init){
+  if(window.fetch){
+    var _f=window.fetch;
+    window.fetch=function(input,init){
       try{
-        if (typeof input==="string") input=toProxy(input);
-        else if (input && input.url){ var u=toProxy(input.url); input=new Request(u, input); }
+        if(typeof input==="string") input=toProxy(input);
+        else if (input && input.url){ var u=toProxy(input.url); input=new Request(u,input); }
       }catch(e){}
-      return _fetch(input, init);
+      return _f(input,init);
     };
   }
-  if (window.XMLHttpRequest){
-    var _open=XMLHttpRequest.prototype.open;
+  if(window.XMLHttpRequest){
+    var _o=XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open=function(m,u){
-      try{ u=toProxy(u); }catch(e){}
-      return _open.apply(this, [m,u].concat([].slice.call(arguments,2)));
+      try{ u=toProxy(u);}catch(e){}
+      return _o.apply(this,[m,u].concat([].slice.call(arguments,2)));
     };
   }
-
-  var mo=new MutationObserver(function(muts){
-    muts.forEach(function(m){
-      m.addedNodes && m.addedNodes.forEach(function(n){
+  var mo=new MutationObserver(function(ms){
+    ms.forEach(function(m){
+      (m.addedNodes||[]).forEach(function(n){
         if(n.nodeType!==1) return;
-        if(n.matches && n.matches("a[href]")){
+        if(n.matches&&n.matches("a[href]")){
           var h=n.getAttribute("href");
-          if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)) n.setAttribute("href", toProxy(h));
+          if(h && !/^https?:|^data:|^mailto:|^javascript:/i.test(h)) n.setAttribute("href",toProxy(h));
         }
-        n.querySelectorAll && n.querySelectorAll("a[href],form").forEach(function(el){
+        n.querySelectorAll&&n.querySelectorAll("a[href],form").forEach(function(el){
           if(el.tagName==="A"){
             var h2=el.getAttribute("href");
-            if(h2 && !/^https?:|^data:|^mailto:|^javascript:/i.test(h2)) el.setAttribute("href", toProxy(h2));
+            if(h2 && !/^https?:|^data:|^mailto:|^javascript:/i.test(h2)) el.setAttribute("href",toProxy(h2));
           }else if(el.tagName==="FORM"){
             var a2=el.getAttribute("action")||"potiboard.php";
-            if(!/^https?:/i.test(a2)) el.setAttribute("action", toProxy(a2));
-            el.addEventListener("submit", function(){
+            if(!/^https?:/i.test(a2)) el.setAttribute("action",toProxy(a2));
+            el.addEventListener("submit",function(){
               var a3=el.getAttribute("action")||el.action||"potiboard.php";
-              try{ el.action = toProxy(a3); }catch(_){}
-            }, true);
+              try{ el.action=toProxy(a3);}catch(_){}
+            },true);
           }
         });
       });
     });
   });
-  mo.observe(document.documentElement, {subtree:true, childList:true});
-
+  mo.observe(document.documentElement,{subtree:true,childList:true});
   if(document.readyState!=="loading") fixAll();
-  else document.addEventListener("DOMContentLoaded", fixAll, {once:true});
-})();
-</script>`;
+  else document.addEventListener("DOMContentLoaded",fixAll,{once:true});
+})();</script>`;
   return html.replace(/<\/body/i, js + "\n</body");
 }
 
-// ---------- メイン ----------
+// ---------- main ----------
 module.exports = async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -279,20 +242,21 @@ module.exports = async function handler(req, res) {
     const upstreamUrl = buildUpstreamUrl(u);
     const upstreamOrigin = new URL(upstreamUrl).origin;
 
-    // メソッド/ボディ中継（PAINT/投稿）
+    // method/body
     const method = req.method || 'GET';
     let upstreamBody;
     if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
 
-    // ---- 代理ジャー（pb_up）を取り出して、上流へ必ず同封する Cookie を合成 ----
+    // ---- merge cookie with jar(pb_up) ----
     function pickCookie(name, cookieHeader) {
       if (!cookieHeader) return null;
-      const m = cookieHeader.match(new RegExp('(?:^|;\\s*)' + name.replace(/[-[\\]{}()*+?.,\\\\^$|#\\s]/g, '\\$&') + '=([^;]*)'));
+      const esc = name.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,'\\$&');
+      const m = cookieHeader.match(new RegExp('(?:^|;\\s*)'+esc+'=([^;]*)'));
       return m ? decodeURIComponent(m[1]) : null;
     }
     const clientCookieHeader = req.headers['cookie'] || '';
-    const jar = pickCookie('pb_up', clientCookieHeader); // URLエンコードされた "a=1; b=2"
-    let mergedCookieForUpstream = clientCookieHeader;
+    const jar = pickCookie('pb_up', clientCookieHeader);
+    let mergedCookieForUpstream = clientCookieHeader || '';
     if (jar) {
       const upstreamPairs = decodeURIComponent(jar);
       mergedCookieForUpstream = mergedCookieForUpstream
@@ -306,26 +270,26 @@ module.exports = async function handler(req, res) {
         'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
         'Accept': req.headers['accept'] || '*/*',
         'Accept-Language': req.headers['accept-language'] || 'ja,en-US;q=0.9,en;q=0.8',
-        'Referer': upstreamUrl,              // 押下元ページに合わせる
-        'Origin':  upstreamOrigin,
+        'Referer': upstreamUrl,
+        'Origin': upstreamOrigin,
         'Accept-Encoding': 'identity',
         ...(req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {}),
-        // ★ ブラウザCookie + 代理ジャーを上流へ同封
         ...(mergedCookieForUpstream ? { 'Cookie': mergedCookieForUpstream } : {})
       },
       body: upstreamBody,
       redirect: 'manual'
     });
 
-    // 30x: Location をプロキシ化
+    // 30x redirect
     if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
       const loc = upstreamRes.headers.get('location');
       if (loc) {
         const abs = new URL(loc, upstreamUrl);
-        const nextPathname = abs.href.replace(UPSTREAM_ORIGIN, '');
+        const nextPathname = abs.href.replace(UPSTREAM_ORIGIN,'').replace(/^\/+/,'');
         const proxied = buildProxyUrl(req, nextPathname);
         res.statusCode = upstreamRes.status;
         res.setHeader('Location', proxied);
+        // also pass cookies on redirects
         rewriteSetCookieHeaders(upstreamRes, req, res);
         res.end();
         return;
@@ -336,16 +300,16 @@ module.exports = async function handler(req, res) {
     const pathname = new URL(upstreamUrl).pathname;
     const isHtml = isHtmlLike(ct, pathname);
 
-    // Set-Cookie を vercel 側に保存 + 代理ジャー作成
+    // Set-Cookie passthrough + jar
     rewriteSetCookieHeaders(upstreamRes, req, res);
 
     if (!isHtml || passthru) {
-      const headers = sanitizeHeaders(upstreamRes.headers, { isHtml: false });
-      for (const [k,v] of headers.entries()) res.setHeader(k, v);
+      const headers = copyResponseHeaders(upstreamRes.headers, {isHtml:false});
+      for (const k in headers) res.setHeader(k, headers[k]);
       res.statusCode = upstreamRes.status;
       const reader = upstreamRes.body.getReader();
       while (true) {
-        const { done, value } = await reader.read();
+        const {done, value} = await reader.read();
         if (done) break;
         res.write(value);
       }
@@ -353,38 +317,29 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    // ---- HTML：UTF-8化 ----
-    const chunks = [];
-    const reader = upstreamRes.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(Buffer.from(value));
-    }
+    // HTML: collect & transcode
+    const chunks=[]; const reader = upstreamRes.body.getReader();
+    while(true){ const {done,value}=await reader.read(); if(done)break; chunks.push(Buffer.from(value)); }
     const buf = Buffer.concat(chunks);
 
     let srcCharset = force || detectFromContentType(ct) || detectFromMeta(buf) || detectFromBytes(buf);
     if (!['utf-8','euc-jp','cp932','iso-2022-jp'].includes(srcCharset)) srcCharset = 'euc-jp';
 
     let htmlUtf8;
-    try {
-      htmlUtf8 = (srcCharset === 'utf-8') ? buf.toString('utf8') : iconv.decode(buf, srcCharset);
-    } catch {
-      try { htmlUtf8 = iconv.decode(buf, 'cp932'); }
-      catch { htmlUtf8 = iconv.decode(buf, 'euc-jp'); }
-    }
+    try { htmlUtf8 = (srcCharset==='utf-8') ? buf.toString('utf8') : iconv.decode(buf, srcCharset); }
+    catch { try { htmlUtf8 = iconv.decode(buf,'cp932'); } catch { htmlUtf8 = iconv.decode(buf,'euc-jp'); } }
 
     htmlUtf8 = rewriteMetaToUtf8(htmlUtf8);
     if (rewrite) htmlUtf8 = rewriteAssetUrls(htmlUtf8, upstreamUrl, req);
     htmlUtf8 = injectRuntimeRewriter(htmlUtf8, upstreamUrl, req);
 
-    const headers = sanitizeHeaders(upstreamRes.headers, { isHtml: true, finalCharset: 'utf-8' });
-    for (const [k,v] of headers.entries()) res.setHeader(k, v);
+    const headers = copyResponseHeaders(upstreamRes.headers, {isHtml:true, finalCharset:'utf-8'});
+    for (const k in headers) res.setHeader(k, headers[k]);
     res.statusCode = upstreamRes.status;
     res.end(htmlUtf8);
 
   } catch (err) {
-    console.error('proxy error:', err && err.stack || err);
+    console.error('proxy error:', err && (err.stack||err));
     res.statusCode = 502;
     res.end('proxy error');
   }
