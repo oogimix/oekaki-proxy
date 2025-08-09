@@ -72,7 +72,12 @@ module.exports = async (req, res) => {
       out[k] = v;
     });
     // 自前ヘッダ
-    out['content-security-policy'] = 'frame-ancestors https://sushihamster.com';
++ out['content-security-policy'] =
++   "frame-ancestors " +
++   "https://sushihamster.com " +         // 本番
++   "https://*.sushihamster.com " +       // www/サブドメインも許可
++   "https://*.github.io " +              // GitHub Pages の検証用（例: oogimix.github.io）
++   "http://localhost:*";                 // ローカル開発時
     out['access-control-allow-origin'] = 'https://sushihamster.com';
     out['access-control-allow-credentials'] = 'true';
     out['cache-control'] = 'no-store';
