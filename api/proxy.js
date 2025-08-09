@@ -24,7 +24,7 @@ async function doFetch(req, url, headers, body) {
 
 module.exports = async (req, res) => {
   const q = req.query || {};
-  const debug = ('__debug' in q) || ('debug' in q);
+  const debug = ('__debug' in q) || ('debug' in q); // デバッグテキスト出力
   try {
     // body
     const chunks=[]; for await (const c of req) chunks.push(c);
@@ -38,7 +38,9 @@ module.exports = async (req, res) => {
 
     // headers
     const headers = { ...req.headers };
-    delete headers.host; delete headers['accept-encoding'];
+    delete headers.host;
+    // 圧縮を明示的に拒否（これ超重要）
+    headers['accept-encoding'] = 'identity';
     headers['user-agent'] = headers['user-agent'] || 'Mozilla/5.0 (oekaki-proxy)';
     headers['origin']  = headers['origin']  || `https://${ORIGIN_HOST}`;
     headers['referer'] = headers['referer'] || `https://${ORIGIN_HOST}/potiboard5/`;
@@ -59,20 +61,23 @@ module.exports = async (req, res) => {
       }
     }
 
-    // common out headers（上流XFO/CSPは剥がして付け直す）
+    // 共通レスポンスヘッダ（まず上流をコピー）
     const out = {};
     r.headers.forEach((v,k)=>{
       const key = k.toLowerCase();
-      if (key==='x-frame-options') return;
-      if (key==='content-security-policy') return;
-      out[k]=v;
+      if (key==='x-frame-options') return;            // 埋め込み拒否は剥がす
+      if (key==='content-security-policy') return;    // CSPは付け直す
+      if (key==='content-encoding') return;           // 圧縮ヘッダは常に外す
+      if (key==='content-length') return;             // 長さも付け直さない
+      out[k] = v;
     });
+    // 自前ヘッダ
     out['content-security-policy'] = 'frame-ancestors https://sushihamster.com';
     out['access-control-allow-origin'] = 'https://sushihamster.com';
     out['access-control-allow-credentials'] = 'true';
     out['cache-control'] = 'no-store';
 
-    // set-cookie補正
+    // Set-Cookie 補正
     const sc = getSetCookies(r.headers);
     if (sc.length) {
       out['set-cookie'] = sc.map(
@@ -80,32 +85,22 @@ module.exports = async (req, res) => {
       );
     }
 
-    // --- デバッグ時はリダイレクトも可視化して返す ---
-    if (debug && isRedirect(r.status)) {
-      const headDump = [];
-      r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
+    // デバッグ：リダイレクトの可視化
+    const isRedir = isRedirect(r.status);
+    if (debug && isRedir) {
+      const headDump=[]; r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
       const loc = r.headers.get('location') || '(none)';
       const abs = new URL(loc, upstreamUrl);
       const rewritten = new URL(abs.pathname + abs.search, `https://${req.headers.host}`).toString();
-
-      const report = [
-        `DEBUG proxy (redirect)`,
-        `tried: ${tried}`,
-        `upstream: ${upstreamUrl}`,
-        `status: ${r.status}`,
-        `location (upstream): ${loc}`,
-        `location (rewritten): ${rewritten}`,
-        `headers:\n${headDump.join('\n')}`
-      ].join('\n');
-
       res.statusCode = r.status;
       res.setHeader('content-type','text/plain; charset=utf-8');
-      return res.end(report);
+      return res.end(
+        `DEBUG proxy (redirect)\ntried: ${tried}\nupstream: ${upstreamUrl}\nstatus: ${r.status}\nlocation (upstream): ${loc}\nlocation (rewritten): ${rewritten}\nheaders:\n${headDump.join('\n')}`
+      );
     }
-    // ------------------------------------------------------
 
-    // 本番挙動：リダイレクトは location を自ドメインに書き換えて返す
-    if (isRedirect(r.status)) {
+    // 本番リダイレクト処理
+    if (isRedir) {
       const loc = r.headers.get('location');
       if (loc) {
         const abs = new URL(loc, upstreamUrl);
@@ -119,28 +114,19 @@ module.exports = async (req, res) => {
     const buf = Buffer.from(await r.arrayBuffer());
 
     if (debug) {
-      const headDump = []; r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
+      const headDump=[]; r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
       const sample = /^text\/|json|javascript|xml|svg/i.test(ct) ? buf.toString('utf8').slice(0,500) : `(binary ${buf.length} bytes)`;
-      const report = [
-        `DEBUG proxy`,
-        `tried: ${tried}`,
-        `upstream: ${upstreamUrl}`,
-        `status: ${r.status}`,
-        `content-type: ${ct || '(none)'}`,
-        `content-length: ${buf.length}`,
-        `headers:\n${headDump.join('\n')}`,
-        `--- body sample ---`,
-        sample
-      ].join('\n');
       res.statusCode = r.status || 200;
       res.setHeader('content-type','text/plain; charset=utf-8');
-      return res.end(report);
+      return res.end(
+        `DEBUG proxy\ntried: ${tried}\nupstream: ${upstreamUrl}\nstatus: ${r.status}\ncontent-type: ${ct || '(none)'}\ncontent-length: ${buf.length}\nheaders:\n${headDump.join('\n')}\n--- body sample ---\n${sample}`
+      );
     }
 
     if (/text\/html/i.test(ct)) {
       let html = buf.toString('utf8');
       html = rewriteHtml(html, req.headers.host);
-      out['content-type'] = 'text/html; charset=utf-8';
+      out['content-type'] = 'text/html; charset=utf-8'; // 圧縮ヘッダは既に外してる
       res.writeHead(200, out); return res.end(html);
     }
 
