@@ -1,32 +1,37 @@
 // api/proxy.js
-// StarServer 上の POTI-board を Vercel 経由で中継するプロキシ
 const ORIGIN_HOST = 'sush1h4mst3r.stars.ne.jp';
 const DEFAULT_PATH = '/potiboard5/potiboard.php';
 
-const isRedirect = s => [301, 302, 303, 307, 308].includes(s);
+const isRedirect = s => [301,302,303,307,308].includes(s);
 const getSetCookies = h => (h.raw && h.raw()['set-cookie']) || [];
 
-function rewriteHtml(html, host) {
-  // 新規タブ抑止
-  html = html.replace(/target=["']?_blank["']?/gi, '');
-  // 相対URL → プロキシ経由の絶対URL
-  html = html.replace(
-    /(href|src|action)=["'](?!https?:\/\/|data:|mailto:)([^"']+)["']/gi,
-    (_, a, p) =>
-      `${a}="${new URL(
-        ('/' + p).replace(/\/{2,}/g, '/').replace(/^\/\.\//, '/'),
-        `https://${host}`
-      ).toString()}"`
-  );
-  return html;
+// 相対URLを「そのページの上流URL」を基準に絶対化し、プロキシ経由URLへ置換
+function rewriteHtml(html, host, upstreamPageUrl) {
+  try {
+    const base = new URL(upstreamPageUrl);
+    html = html.replace(/target=["']?_blank["']?/gi, '');
+    html = html.replace(
+      /(href|src|action)=["'](?!https?:\/\/|data:|mailto:|javascript:)([^"']+)["']/gi,
+      (_, attr, p) => {
+        // p をそのページの上流URL(base)基準で解決
+        const absOnOrigin = new URL(p, base); // 例: https://stars.ne.jp/potiboard5/potiboard.php
+        // それをプロキシの同パスへ
+        const proxied = new URL(absOnOrigin.pathname + absOnOrigin.search, `https://${host}`).toString();
+        return `${attr}="${proxied}"`;
+      }
+    );
+    return html;
+  } catch {
+    return html;
+  }
 }
 
 async function doFetch(req, url, headers, body) {
   return fetch(url, {
     method: req.method,
     headers,
-    body: ['GET', 'HEAD', 'OPTIONS'].includes(req.method) ? undefined : body,
-    redirect: 'manual',
+    body: ['GET','HEAD','OPTIONS'].includes(req.method) ? undefined : body,
+    redirect: 'manual'
   });
 }
 
@@ -34,7 +39,7 @@ module.exports = async (req, res) => {
   const q = req.query || {};
   const debug = '__debug' in q || 'debug' in q;
 
-  // CORS preflight（念のため）
+  // CORS (preflight)
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     res.setHeader('access-control-allow-origin', 'https://sushihamster.com');
@@ -45,36 +50,33 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // 受信ボディ
+    // body
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
 
-    // 上流URL（__alt があればそれを優先）
-    const fromU = (q.u || '').toString().replace(/^\//, '');
+    // upstream URL
+    const fromU = (q.u || '').toString().replace(/^\//,'');
     let upstreamUrl = q.__alt
       ? q.__alt.toString()
-      : `https://${ORIGIN_HOST}/${fromU || DEFAULT_PATH.replace(/^\//, '')}`;
+      : `https://${ORIGIN_HOST}/${fromU || DEFAULT_PATH.replace(/^\//,'')}`;
 
-    // 転送ヘッダ
+    // headers （gzip拒否 & UA・参照元補完）
     const headers = { ...req.headers };
     delete headers.host;
-    // 圧縮を拒否（HTMLを書き換えるため/ gzipヘッダの不整合回避）
-    headers['accept-encoding'] = 'identity';
+    headers['accept-encoding'] = 'identity'; // 圧縮は受けない
     headers['user-agent'] = headers['user-agent'] || 'Mozilla/5.0 (oekaki-proxy)';
-    // 重要：Referer を “今回の転送先（upstreamUrl）” に固定
-    headers['origin']  = upstreamUrl.startsWith('https://')
-      ? `https://${ORIGIN_HOST}` : `http://${ORIGIN_HOST}`;
-    headers['referer'] = upstreamUrl;
+    headers['origin']  = upstreamUrl.startsWith('https://') ? `https://${ORIGIN_HOST}` : `http://${ORIGIN_HOST}`;
+    headers['referer'] = upstreamUrl; // ★ 毎回、そのリクエスト先を参照元に
 
-    // まず HTTPS → 失敗したら HTTP にフォールバック
+    // fetch（HTTPS → 失敗時 HTTP）
     let r;
     let tried = 'https';
     try {
       r = await doFetch(req, upstreamUrl, headers, body);
     } catch (e) {
       if (!q.__alt) {
-        upstreamUrl = `http://${ORIGIN_HOST}/${fromU || DEFAULT_PATH.replace(/^\//, '')}`;
+        upstreamUrl = `http://${ORIGIN_HOST}/${fromU || DEFAULT_PATH.replace(/^\//,'')}`;
         headers['origin']  = `http://${ORIGIN_HOST}`;
         headers['referer'] = upstreamUrl;
         r = await doFetch(req, upstreamUrl, headers, body);
@@ -84,51 +86,45 @@ module.exports = async (req, res) => {
       }
     }
 
-    // レスポンスヘッダ（上流コピーしつつ調整）
+    // out headers（上流コピー＋調整）
     const out = {};
-    r.headers.forEach((v, k) => {
+    r.headers.forEach((v,k)=>{
       const key = k.toLowerCase();
-      if (key === 'x-frame-options') return;            // 埋め込み拒否は剥がす
-      if (key === 'content-security-policy') return;    // CSP は付け直す
-      if (key === 'content-encoding') return;           // 圧縮ヘッダは外す
-      if (key === 'content-length') return;             // 長さは付け直さない
-      out[k] = v;
+      if (key==='x-frame-options') return;
+      if (key==='content-security-policy') return;
+      if (key==='content-encoding') return;
+      if (key==='content-length') return;
+      out[k]=v;
     });
-
-    // 自前ヘッダ（親オリジン許可 & キャッシュ無効）
     out['content-security-policy'] =
-      "frame-ancestors " +
-      "https://sushihamster.com " +
-      "https://*.sushihamster.com " +
-      "https://*.github.io " +
-      "http://localhost:* http://127.0.0.1:*";
+      "frame-ancestors https://sushihamster.com https://*.sushihamster.com https://*.github.io http://localhost:* http://127.0.0.1:*";
     out['access-control-allow-origin'] = 'https://sushihamster.com';
     out['access-control-allow-credentials'] = 'true';
     out['cache-control'] = 'no-store';
 
-    // Cookie ドメイン補正 + SameSite=None; Secure
+    // cookie 補正
     const sc = getSetCookies(r.headers);
     if (sc.length) {
       out['set-cookie'] = sc.map(
-        s => s.replace(/;?\s*Domain=[^;]+/i, '') + `; Domain=${req.headers.host}; SameSite=None; Secure`
+        s => s.replace(/;?\s*Domain=[^;]+/i,'') + `; Domain=${req.headers.host}; SameSite=None; Secure`
       );
     }
 
-    // デバッグ時：リダイレクト内容をテキストで可視化
-    const redir = isRedirect(r.status);
-    if (debug && redir) {
+    // debug: redirect 可視化
+    const isRedir = [301,302,303,307,308].includes(r.status);
+    if (debug && isRedir) {
       const loc = r.headers.get('location') || '(none)';
       const abs = new URL(loc, upstreamUrl);
       const rewritten = new URL(abs.pathname + abs.search, `https://${req.headers.host}`).toString();
       res.statusCode = r.status;
-      res.setHeader('content-type', 'text/plain; charset=utf-8');
+      res.setHeader('content-type','text/plain; charset=utf-8');
       return res.end(
         `DEBUG proxy (redirect)\ntried: ${tried}\nupstream: ${upstreamUrl}\nstatus: ${r.status}\nlocation (upstream): ${loc}\nlocation (rewritten): ${rewritten}\n`
       );
     }
 
-    // 本番のリダイレクト処理：Location を自ドメインへ張り替え
-    if (redir) {
+    // 本番のリダイレクト処理（Location張り替え）
+    if (isRedir) {
       const loc = r.headers.get('location');
       if (loc) {
         const abs = new URL(loc, upstreamUrl);
@@ -138,21 +134,20 @@ module.exports = async (req, res) => {
       return res.end();
     }
 
-    // 本体
+    // body
     const ct = r.headers.get('content-type') || '';
     const buf = Buffer.from(await r.arrayBuffer());
 
     if (debug) {
       res.statusCode = r.status || 200;
-      res.setHeader('content-type', 'text/plain; charset=utf-8');
-      return res.end(
-        `DEBUG proxy\nstatus: ${r.status}\ntried: ${tried}\nupstream: ${upstreamUrl}\ncontent-type: ${ct || '(none)'}\ncontent-length: ${buf.length}\n`
-      );
+      res.setHeader('content-type','text/plain; charset=utf-8');
+      return res.end(`DEBUG proxy\nstatus: ${r.status}\ntried: ${tried}\nupstream: ${upstreamUrl}\ncontent-type: ${ct || '(none)'}\ncontent-length: ${buf.length}\n`);
     }
 
     if (/text\/html/i.test(ct)) {
       let html = buf.toString('utf8');
-      html = rewriteHtml(html, req.headers.host);
+      // ★ ここが修正点：そのページの上流URLを基準に相対リンクを解決
+      html = rewriteHtml(html, req.headers.host, upstreamUrl);
       out['content-type'] = 'text/html; charset=utf-8';
       res.writeHead(200, out);
       return res.end(html);
@@ -164,7 +159,7 @@ module.exports = async (req, res) => {
 
   } catch (e) {
     res.statusCode = 502;
-    res.setHeader('content-type', 'text/plain; charset=utf-8');
+    res.setHeader('content-type','text/plain; charset=utf-8');
     res.end(`proxy error: ${e?.name || ''} ${e?.code || ''} ${e?.message || e}`);
   }
 };
