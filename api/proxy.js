@@ -1,14 +1,15 @@
 // api/proxy.js
 // Vercel Node (CommonJS)
 //
-// ✔ 上流(EUC/CP932/ISO-2022-JP)→UTF-8再エンコード
+// ✔ 上流(EUC-JP/CP932/ISO-2022-JP)→UTF-8再エンコード
 // ✔ <meta charset> を安全に utf-8 へ統一
 // ✔ href/src/action 等を /api/proxy?u=... に書き換え（静的）
-// ✔ POST/マルチパートのボディ中継（PAINT/投稿用）
+// ✔ POST/マルチパートのボディ中継（PAINT/投稿）
 // ✔ Set-Cookie を vercel 側に変換 (SameSite=None; Secure; Partitioned)
+// ✔ ★ 上流 Set-Cookie をまとめた「代理ジャー pb_up」を発行し、以後のリクエストで必ず上流へ同封
 // ✔ Referer/Origin を上流に合わせる
-// ✔ ★ 実行時に form/fetch/XHR をフック（動的）。さらに
-//     “/api/potiboard.php?...” に化けた絶対URLも強制で /api/proxy?u=… に矯正
+// ✔ 実行時に form/fetch/XHR をフックして送信先を強制プロキシ化（動的）
+// ✔ “/api/potiboard.php?...” に化けたURLも送信直前に強制救済
 
 const iconv = require('iconv-lite');
 require('iconv-lite/encodings'); // ISO-2022-JP 有効化
@@ -80,29 +81,35 @@ function sanitizeHeaders(h, { isHtml, finalCharset }) {
   return out;
 }
 
-// ---------- Set-Cookie 書き換え（Partitioned） ----------
+// ---------- Set-Cookie 書き換え + 代理ジャー ----------
 function rewriteSetCookieHeaders(upstreamRes, req, res) {
   const raw = upstreamRes.headers.raw?.() || {};
   const setCookies = raw['set-cookie'] || [];
-  if (!setCookies.length) return;
-
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
 
-  const rewritten = setCookies.map(line => {
-    let s = line;
+  if (!setCookies.length) return;
 
+  // 1) 個別 Set-Cookie を iframe で効く属性に補強
+  const rewritten = setCookies.map(line => {
+    let s = String(line);
     if (/;\s*Domain=/i.test(s)) s = s.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
     else s += `; Domain=${host}`;
-
     if (/;\s*Path=/i.test(s)) s = s.replace(/;\s*Path=[^;]*/i, `; Path=/`);
     else s += `; Path=/`;
-
     if (!/;\s*SameSite=/i.test(s))   s += '; SameSite=None';
     if (!/;\s*Secure/i.test(s))      s += '; Secure';
     if (!/;\s*Partitioned/i.test(s)) s += '; Partitioned';
-
     return s;
   });
+
+  // 2) 上流クッキーをまとめた「代理ジャー pb_up」を保存（URLエンコードで格納）
+  const pairs = setCookies.map(c => String(c).split(';',1)[0]).filter(Boolean); // "name=value"
+  if (pairs.length) {
+    const jarValue = encodeURIComponent(pairs.join('; ')); // "a=1; b=2"
+    rewritten.push(
+      `pb_up=${jarValue}; Path=/; Max-Age=31536000; SameSite=None; Secure; Partitioned; Domain=${host}`
+    );
+  }
 
   res.setHeader('Set-Cookie', rewritten);
 }
@@ -176,7 +183,7 @@ function injectRuntimeRewriter(html, upstreamAbs, req) {
         return SELF+"/api/proxy?u="+encodeURIComponent(rel);
       }
 
-      // 2) ★ 自サイトの /api/potiboard.php?... もプロキシへ救済
+      // 2) ★ 自サイトの /api/ に来た potiboard.php も上流に復元してプロキシへ
       if(abs.startsWith(SELF+"/api/")){
         var path = abs.substring((SELF+"/api/").length); // 例: "potiboard.php?mode=saveimage..."
         var upGuess = new URL(path, UP_BASE).toString(); // https://.../potiboard5/potiboard.php?...
@@ -272,10 +279,26 @@ module.exports = async function handler(req, res) {
     const upstreamUrl = buildUpstreamUrl(u);
     const upstreamOrigin = new URL(upstreamUrl).origin;
 
-    // メソッド/ボディ中継（PAINT/投稿用）
+    // メソッド/ボディ中継（PAINT/投稿）
     const method = req.method || 'GET';
     let upstreamBody;
     if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
+
+    // ---- 代理ジャー（pb_up）を取り出して、上流へ必ず同封する Cookie を合成 ----
+    function pickCookie(name, cookieHeader) {
+      if (!cookieHeader) return null;
+      const m = cookieHeader.match(new RegExp('(?:^|;\\s*)' + name.replace(/[-[\\]{}()*+?.,\\\\^$|#\\s]/g, '\\$&') + '=([^;]*)'));
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+    const clientCookieHeader = req.headers['cookie'] || '';
+    const jar = pickCookie('pb_up', clientCookieHeader); // URLエンコードされた "a=1; b=2"
+    let mergedCookieForUpstream = clientCookieHeader;
+    if (jar) {
+      const upstreamPairs = decodeURIComponent(jar);
+      mergedCookieForUpstream = mergedCookieForUpstream
+        ? `${mergedCookieForUpstream}; ${upstreamPairs}`
+        : upstreamPairs;
+    }
 
     const upstreamRes = await fetch(upstreamUrl, {
       method,
@@ -287,7 +310,8 @@ module.exports = async function handler(req, res) {
         'Origin':  upstreamOrigin,
         'Accept-Encoding': 'identity',
         ...(req.headers['content-type'] ? { 'Content-Type': req.headers['content-type'] } : {}),
-        ...(req.headers['cookie']       ? { 'Cookie': req.headers['cookie'] } : {})
+        // ★ ブラウザCookie + 代理ジャーを上流へ同封
+        ...(mergedCookieForUpstream ? { 'Cookie': mergedCookieForUpstream } : {})
       },
       body: upstreamBody,
       redirect: 'manual'
@@ -312,7 +336,7 @@ module.exports = async function handler(req, res) {
     const pathname = new URL(upstreamUrl).pathname;
     const isHtml = isHtmlLike(ct, pathname);
 
-    // Set-Cookie を vercel 側に保存できるよう書き換え
+    // Set-Cookie を vercel 側に保存 + 代理ジャー作成
     rewriteSetCookieHeaders(upstreamRes, req, res);
 
     if (!isHtml || passthru) {
