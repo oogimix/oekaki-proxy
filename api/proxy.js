@@ -28,13 +28,11 @@ function readRawBody(req){
   });
 }
 function getSetCookiesArray(res) {
-  // undici >=18: getSetCookie(); それ以外: get('set-cookie'); なければ []
   if (typeof res.headers.getSetCookie === 'function') {
     try { return res.headers.getSetCookie(); } catch {}
   }
   const sc = res.headers.get('set-cookie');
   if (!sc) return [];
-  // 複数が結合されてる可能性は小さいが、念のためセミコロンと区別つかないので1本扱い
   return Array.isArray(sc) ? sc : [sc];
 }
 
@@ -72,7 +70,6 @@ function isHtmlLike(contentType, pathname){
 function copyResponseHeaders(srcHeaders, {isHtml, finalCharset}) {
   const out = {};
   for (const [k,v] of srcHeaders.entries()) out[k.toLowerCase()] = v;
-  // remove problematic
   ['x-frame-options','content-security-policy','content-length','content-encoding','transfer-encoding']
     .forEach(k=>{ delete out[k]; });
   if (isHtml) out['content-type'] = `text/html; charset=${finalCharset||'utf-8'}`;
@@ -97,14 +94,12 @@ function rewriteSetCookieHeaders(upstreamRes, req, res) {
     return s;
   });
 
-  // jar
   const pairs = setCookies.map(c=>String(c).split(';',1)[0]).filter(Boolean);
   if (pairs.length){
     const jarValue = encodeURIComponent(pairs.join('; '));
     rewritten.push(`pb_up=${jarValue}; Path=/; Max-Age=31536000; SameSite=None; Secure; Partitioned; Domain=${host}`);
   }
 
-  // set multiple Set-Cookie headers
   res.setHeader('Set-Cookie', rewritten);
 }
 
@@ -128,7 +123,8 @@ function toProxyUrl(selfOrigin, absUpstreamUrl){
 function rewriteAssetUrls(html, htmlAbsUrl, req){
   const selfOrigin = buildSelfOrigin(req);
   const SKIP=/^(data:|javascript:|mailto:|about:)/i;
-  return html.replace(/\b(href|src|action|data|poster)\s*=\s*("([^"]+)"|'([^']+)'|([^"'=\s>]+))/ig,
+  // ★ action は書き換えない（動的フックでやる）←二重包み対策
+  return html.replace(/\b(href|src|data|poster)\s*=\s*("([^"]+)"|'([^']+)'|([^"'=\s>]+))/ig,
     (m,attr,_qv,dq,sq,bare)=>{
       const val = dq ?? sq ?? bare ?? '';
       if (!val || SKIP.test(val)) return m;
@@ -150,6 +146,12 @@ function injectRuntimeRewriter(html, upstreamAbs, req){
   var UP_BASE=${JSON.stringify(upBase)};
   function toProxy(u){
     try{
+      // 既に proxy?u=... 形式なら二重包みしない（相対ならSELFを付与）
+      var raw=String(u);
+      if (/^(?:\\/??api\\/)?proxy\\?u=/.test(raw)) {
+        return raw.startsWith('http') ? raw : (raw.startsWith('/') ? (SELF+raw) : (SELF+'/'+raw));
+      }
+
       var abs=new URL(u,UP_BASE).toString();
       if(abs.startsWith(UP_ORIGIN)){
         var rel=abs.replace(UP_ORIGIN+"/","");
@@ -242,7 +244,6 @@ module.exports = async function handler(req, res) {
     const upstreamUrl = buildUpstreamUrl(u);
     const upstreamOrigin = new URL(upstreamUrl).origin;
 
-    // method/body
     const method = req.method || 'GET';
     let upstreamBody;
     if (!['GET','HEAD'].includes(method)) upstreamBody = await readRawBody(req);
@@ -289,7 +290,6 @@ module.exports = async function handler(req, res) {
         const proxied = buildProxyUrl(req, nextPathname);
         res.statusCode = upstreamRes.status;
         res.setHeader('Location', proxied);
-        // also pass cookies on redirects
         rewriteSetCookieHeaders(upstreamRes, req, res);
         res.end();
         return;
@@ -300,7 +300,6 @@ module.exports = async function handler(req, res) {
     const pathname = new URL(upstreamUrl).pathname;
     const isHtml = isHtmlLike(ct, pathname);
 
-    // Set-Cookie passthrough + jar
     rewriteSetCookieHeaders(upstreamRes, req, res);
 
     if (!isHtml || passthru) {
