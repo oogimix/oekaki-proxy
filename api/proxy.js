@@ -4,9 +4,6 @@ const DEFAULT_PATH = '/potiboard5/potiboard.php';
 
 const isRedirect = s => [301,302,303,307,308].includes(s);
 const getSetCookies = h => (h.raw && h.raw()['set-cookie']) || [];
-const asText = async (r) => {
-  try { return await r.text(); } catch { return ''; }
-};
 
 function rewriteHtml(html, host) {
   html = html.replace(/target=["']?_blank["']?/gi, '');
@@ -16,7 +13,6 @@ function rewriteHtml(html, host) {
   );
   return html;
 }
-
 async function doFetch(req, url, headers, body) {
   return fetch(url, {
     method: req.method,
@@ -27,45 +23,43 @@ async function doFetch(req, url, headers, body) {
 }
 
 module.exports = async (req, res) => {
-  const start = Date.now();
   const q = req.query || {};
   const debug = ('__debug' in q) || ('debug' in q);
   try {
-    // 受信ボディ
+    // body
     const chunks=[]; for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
 
-    // 上流URLを構築（__alt で任意URLをテスト可能）
+    // upstream URL
+    const fromU = (q.u || '').toString().replace(/^\//,'');
     let upstreamUrl = q.__alt
       ? q.__alt.toString()
-      : `https://${ORIGIN_HOST}/${((q.u||'').toString().replace(/^\//,'') || DEFAULT_PATH.replace(/^\//,''))}`;
+      : `https://${ORIGIN_HOST}/${fromU || DEFAULT_PATH.replace(/^\//,'')}`;
 
-    // 転送ヘッダ整備
+    // headers
     const headers = { ...req.headers };
     delete headers.host; delete headers['accept-encoding'];
-    const httpsOrigin = `https://${ORIGIN_HOST}`;
-    headers['referer']    = headers['referer'] || `${httpsOrigin}/potiboard5/`;
-    headers['origin']     = headers['origin']  || httpsOrigin;
     headers['user-agent'] = headers['user-agent'] || 'Mozilla/5.0 (oekaki-proxy)';
+    headers['origin']  = headers['origin']  || `https://${ORIGIN_HOST}`;
+    headers['referer'] = headers['referer'] || `https://${ORIGIN_HOST}/potiboard5/`;
 
-    // まず HTTPS
-    let r, schemeTried = 'https';
+    // try HTTPS → fallback HTTP
+    let r, tried = 'https';
     try {
       r = await doFetch(req, upstreamUrl, headers, body);
-    } catch (e) {
-      // HTTPS失敗 → HTTPで再試行
+    } catch {
       if (!q.__alt) {
-        upstreamUrl = `http://${ORIGIN_HOST}/${((q.u||'').toString().replace(/^\//,'') || DEFAULT_PATH.replace(/^\//,''))}`;
+        upstreamUrl = `http://${ORIGIN_HOST}/${fromU || DEFAULT_PATH.replace(/^\//,'')}`;
         headers['origin']  = `http://${ORIGIN_HOST}`;
         headers['referer'] = `http://${ORIGIN_HOST}/potiboard5/`;
         r = await doFetch(req, upstreamUrl, headers, body);
-        schemeTried = 'http';
+        tried = 'http';
       } else {
         throw e;
       }
     }
 
-    // 出力ヘッダ（共通）
+    // common out headers（上流XFO/CSPは剥がして付け直す）
     const out = {};
     r.headers.forEach((v,k)=>{
       const key = k.toLowerCase();
@@ -78,7 +72,7 @@ module.exports = async (req, res) => {
     out['access-control-allow-credentials'] = 'true';
     out['cache-control'] = 'no-store';
 
-    // Cookie補正
+    // set-cookie補正
     const sc = getSetCookies(r.headers);
     if (sc.length) {
       out['set-cookie'] = sc.map(
@@ -86,7 +80,31 @@ module.exports = async (req, res) => {
       );
     }
 
-    // リダイレクトなら Location を自ドメインへ
+    // --- デバッグ時はリダイレクトも可視化して返す ---
+    if (debug && isRedirect(r.status)) {
+      const headDump = [];
+      r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
+      const loc = r.headers.get('location') || '(none)';
+      const abs = new URL(loc, upstreamUrl);
+      const rewritten = new URL(abs.pathname + abs.search, `https://${req.headers.host}`).toString();
+
+      const report = [
+        `DEBUG proxy (redirect)`,
+        `tried: ${tried}`,
+        `upstream: ${upstreamUrl}`,
+        `status: ${r.status}`,
+        `location (upstream): ${loc}`,
+        `location (rewritten): ${rewritten}`,
+        `headers:\n${headDump.join('\n')}`
+      ].join('\n');
+
+      res.statusCode = r.status;
+      res.setHeader('content-type','text/plain; charset=utf-8');
+      return res.end(report);
+    }
+    // ------------------------------------------------------
+
+    // 本番挙動：リダイレクトは location を自ドメインに書き換えて返す
     if (isRedirect(r.status)) {
       const loc = r.headers.get('location');
       if (loc) {
@@ -98,23 +116,14 @@ module.exports = async (req, res) => {
 
     // 本体
     const ct = r.headers.get('content-type') || '';
-    const ab = await r.arrayBuffer();
-    const buf = Buffer.from(ab);
+    const buf = Buffer.from(await r.arrayBuffer());
 
-    // --- デバッグ: 何も出ない問題を可視化 ---
     if (debug) {
-      const headDump = [];
-      r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
-      let sample = '';
-      if (/^text\/|json|javascript|xml|svg/i.test(ct)) {
-        const txt = buf.toString('utf8');
-        sample = txt.slice(0, 500);
-      } else {
-        sample = `(binary ${buf.length} bytes)`;
-      }
+      const headDump = []; r.headers.forEach((v,k)=>headDump.push(`${k}: ${v}`));
+      const sample = /^text\/|json|javascript|xml|svg/i.test(ct) ? buf.toString('utf8').slice(0,500) : `(binary ${buf.length} bytes)`;
       const report = [
         `DEBUG proxy`,
-        `tried: ${schemeTried}`,
+        `tried: ${tried}`,
         `upstream: ${upstreamUrl}`,
         `status: ${r.status}`,
         `content-type: ${ct || '(none)'}`,
@@ -127,7 +136,6 @@ module.exports = async (req, res) => {
       res.setHeader('content-type','text/plain; charset=utf-8');
       return res.end(report);
     }
-    // --------------------
 
     if (/text\/html/i.test(ct)) {
       let html = buf.toString('utf8');
