@@ -1,5 +1,6 @@
-// api/proxy.js — 文字コードしつこめ判定 + 変換（CommonJS）
+// 先頭あたり
 const iconv = require('iconv-lite');
+require('iconv-lite/encodings'); // ★これを追加：EUC-JP/ISO-2022-JPなどを有効化
 
 module.exports = async function handler(req, res) {
   try {
