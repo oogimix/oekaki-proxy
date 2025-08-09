@@ -138,11 +138,11 @@ module.exports = async (req, res) => {
     }
 
     // ---- ここが NEO 特有：saveimage POST は 200 'ok' に正規化 ----
-    const urlObj = new URL(upstreamUrl);
-    const isSaveImagePost =
-      req.method === 'POST' &&
-      /potiboard\.php$/i.test(urlObj.pathname) &&
-      /(?:^|&)mode=saveimage(?:&|$)/i.test(urlObj.search);
+ const urlObj = new URL(upstreamUrl);
+ const isSaveImagePost =
+   req.method === 'POST' &&
+   /potiboard\.php$/i.test(urlObj.pathname) &&
+   (urlObj.searchParams.get('mode') === 'saveimage');
 
     if (isSaveImagePost && isRedirect(r.status)) {
       // 上流の Set-Cookie などは out に反映済み。本文は 'ok' を返す
